@@ -1,1 +1,4 @@
-{"signal_threshold": 4, "demo_mode": true}
+{
+  "signal_threshold": 4,
+  "demo_mode": true
+}

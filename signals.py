@@ -1,22 +1,32 @@
 """
-Signal Engine — EUR/USD London+NY Session Scalp
-=================================================
-Pair:   EUR/USD ONLY
-Target: 26 pip TP | 13 pip SL | 2:1 R:R
+Signal Engine — Strategy V4 "Triple-Confirm Trend Scalp"
+=========================================================
+Pair:     EUR/USD ONLY
+Sessions: All 3 active windows (handled by bot.py session gate)
+  06:00–09:00 UTC  Asian/London overlap  (14:00–17:00 SGT)
+  09:00–12:00 UTC  London peak           (17:00–20:00 SGT)
+  13:00–16:00 UTC  NY open               (21:00–00:00 SGT)
 
-FIXES APPLIED:
-  FIX-A: L2 and L3 are now separated via state memory.
-          When L2 fires, direction + timestamp are saved to state["l2_pending"].
-          On the NEXT scan(s), only L3 is checked (up to 30 min window).
-          This mirrors real price action: breakout → pullback → entry.
-  FIX-B: RSI thresholds loosened (42→52 buy, 58→48 sell) so the
-          pullback confirmation is actually reachable after a breakout.
-  FIX-C: Every layer now logs its exact pass/fail so Railway logs
-          show precisely which condition is blocking each scan.
+TP:  12 pips  |  SL: 8 pips  |  R:R: 1.5
+Max hold: 45 min
+
+SIGNAL LOGIC (4 layers):
+  L0  H4  EMA50      → macro direction (BUY / SELL)
+  L1  H4  ATR(14)    → >6 pips (trending, not flat)
+  L2  H1  EMA20+EMA50→ price on correct side of BOTH EMAs
+       H1  RSI(14)   → 30–70 (not extreme)
+       H1  ATR(14)   → >4.5 pips (session active)
+  L3  M15 EMA9/EMA21 → EMA9 above EMA21 (bull) or below (bear)
+       M15 RSI(14)   → 38–62 (momentum zone, not overextended)
+       M15 ATR(14)   → >4.5 pips
+  L4  M5  EMA9       → close above (buy) / below (sell) EMA9
+       M5  body      → ≥50% of candle range in direction
+       M5  RSI(14)   → 35–65 (no overextended entry)
 """
 
-import os, requests, logging
-from datetime import datetime, timezone
+import os
+import logging
+import requests
 
 log = logging.getLogger(__name__)
 
@@ -24,14 +34,14 @@ log = logging.getLogger(__name__)
 class SafeFilter(logging.Filter):
     def __init__(self):
         self.api_key = os.environ.get("OANDA_API_KEY", "")
+
     def filter(self, record):
         if self.api_key and self.api_key in str(record.getMessage()):
             record.msg = record.msg.replace(self.api_key, "***")
         return True
 
-log.addFilter(SafeFilter())
 
-L2_EXPIRY_MINUTES = 45  # how long to wait for L3 after L2 fires
+log.addFilter(SafeFilter())
 
 
 class SignalEngine:
@@ -40,12 +50,17 @@ class SignalEngine:
         self.base_url = "https://api-fxpractice.oanda.com"
         self.headers  = {"Authorization": "Bearer " + self.api_key}
 
+    # ─────────────────────────────────────────────────────────────────
+    # DATA FETCHING
+    # ─────────────────────────────────────────────────────────────────
+
     def _fetch_candles(self, instrument, granularity, count=60):
         url    = self.base_url + "/v3/instruments/" + instrument + "/candles"
         params = {"count": str(count), "granularity": granularity, "price": "M"}
         for attempt in range(3):
             try:
-                r = requests.get(url, headers=self.headers, params=params, timeout=10)
+                r = requests.get(url, headers=self.headers,
+                                 params=params, timeout=10)
                 if r.status_code == 200:
                     c = [x for x in r.json()["candles"] if x["complete"]]
                     return (
@@ -54,10 +69,15 @@ class SignalEngine:
                         [float(x["mid"]["l"]) for x in c],
                         [float(x["mid"]["o"]) for x in c],
                     )
-                log.warning("Candle " + granularity + " attempt " + str(attempt+1) + " HTTP " + str(r.status_code))
+                log.warning("Candle " + granularity + " attempt " +
+                            str(attempt + 1) + " HTTP " + str(r.status_code))
             except Exception as e:
                 log.warning("Candle fetch error: " + str(e))
         return [], [], [], []
+
+    # ─────────────────────────────────────────────────────────────────
+    # INDICATORS
+    # ─────────────────────────────────────────────────────────────────
 
     def _ema(self, data, period):
         if not data:
@@ -71,20 +91,19 @@ class SignalEngine:
             emas.append((p - emas[-1]) * mult + emas[-1])
         return emas
 
-    def _rsi(self, closes, period=7):
+    def _rsi(self, closes, period=14):
         if len(closes) < period + 1:
             return 50.0
         gains, losses = [], []
         for i in range(1, len(closes)):
-            delta = closes[i] - closes[i-1]
+            delta = closes[i] - closes[i - 1]
             gains.append(max(delta, 0))
             losses.append(max(-delta, 0))
         avg_gain = sum(gains[-period:]) / period
         avg_loss = sum(losses[-period:]) / period
         if avg_loss == 0:
             return 100.0
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
+        return 100 - (100 / (1 + avg_gain / avg_loss))
 
     def _atr(self, highs, lows, closes, period=14):
         if len(highs) < period + 1:
@@ -93,52 +112,30 @@ class SignalEngine:
         for i in range(1, len(highs)):
             tr = max(
                 highs[i] - lows[i],
-                abs(highs[i] - closes[i-1]),
-                abs(lows[i] - closes[i-1])
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i]  - closes[i - 1]),
             )
             trs.append(tr)
         return sum(trs[-period:]) / period
 
+    # ─────────────────────────────────────────────────────────────────
+    # MAIN SIGNAL
+    # ─────────────────────────────────────────────────────────────────
+
     def analyze(self, asset="EURUSD", state=None):
         """
-        state dict is passed in so L2 pending persists between scans.
-        Falls back gracefully if state=None.
+        Returns (score, direction, reason_string).
+        score=4 + direction != "NONE"  →  fire trade.
+        Works for all sessions — session gating is handled by bot.py.
         """
-        return self._scalp_eurusd("EUR_USD", state=state)
+        return self._v4_signal("EUR_USD")
 
-    def _scalp_eurusd(self, instrument, state=None):
+    def _v4_signal(self, instrument):
         reasons = []
-        score   = 0
 
-        # ── FIX-A: Check if L2 already fired and we are waiting for L3 ──
-        if state is not None:
-            pending = state.get("l2_pending", {})
-            if pending.get("instrument") == instrument:
-                age_minutes = (
-                    datetime.now(timezone.utc) -
-                    datetime.fromisoformat(pending["timestamp"])
-                ).total_seconds() / 60
-
-                if age_minutes <= L2_EXPIRY_MINUTES:
-                    log.info(
-                        instrument + ": L2 pending (" + pending["direction"] +
-                        ") — checking L3 entry [" + str(round(age_minutes, 1)) + " min elapsed]"
-                    )
-                    return self._check_l3_only(
-                        instrument,
-                        direction=pending["direction"],
-                        score_so_far=3,
-                        reasons=["(L0+L1+L2 already confirmed — checking L3 entry only)"],
-                        state=state,
-                    )
-                else:
-                    log.info(instrument + ": L2 pending EXPIRED (" + str(round(age_minutes, 1)) + " min) — resetting")
-                    state.pop("l2_pending", None)
-
-        # ── L0: H4 MACRO TREND — EMA50 ───────────────────────────────────
+        # ── L0: H4 EMA50 macro direction ─────────────────────────────
         h4_c, h4_h, h4_l, _ = self._fetch_candles(instrument, "H4", 60)
         if len(h4_c) < 51:
-            log.info(instrument + ": L0 SKIP — not enough H4 data (" + str(len(h4_c)) + ")")
             return 0, "NONE", "Not enough H4 data (" + str(len(h4_c)) + ")"
 
         h4_ema50 = self._ema(h4_c, 50)[-1]
@@ -146,231 +143,156 @@ class SignalEngine:
 
         if h4_price > h4_ema50:
             direction = "BUY"
-            reasons.append("✅ L0 H4 BUY above EMA50=" + str(round(h4_ema50, 5)))
+            reasons.append("✅ L0 H4 BUY — price " + str(round(h4_price, 5)) +
+                            " above EMA50=" + str(round(h4_ema50, 5)))
         elif h4_price < h4_ema50:
             direction = "SELL"
-            reasons.append("✅ L0 H4 SELL below EMA50=" + str(round(h4_ema50, 5)))
+            reasons.append("✅ L0 H4 SELL — price " + str(round(h4_price, 5)) +
+                            " below EMA50=" + str(round(h4_ema50, 5)))
         else:
-            log.info(instrument + ": L0 FAIL — H4 EMA50 flat")
-            return 0, "NONE", "H4 EMA50 flat — no macro trend"
+            return 0, "NONE", "H4 EMA50 flat — no macro direction"
 
-        score = 1
-
-        # ── VETO: FLAT RANGE BLOCK — H1 ATR < 6 pips ────────────────────
-        h1_c, h1_h, h1_l, _ = self._fetch_candles(instrument, "H1", 60)
-        if len(h1_c) < 20:
-            log.info(instrument + ": VETO SKIP — not enough H1 data (" + str(len(h1_c)) + ")")
-            return score, "NONE", " | ".join(reasons) + " | Not enough H1 data"
-
-        h1_atr      = self._atr(h1_h, h1_l, h1_c, 14)
-        h1_atr_pip  = h1_atr / 0.0001
-        MIN_ATR_PIPS = 4.0
-
-        if h1_atr_pip < MIN_ATR_PIPS:
-            msg = "🚫 VETO FLAT: H1 ATR=" + str(round(h1_atr_pip, 1)) + "p < " + str(MIN_ATR_PIPS) + "p — market too quiet"
+        # ── L1: H4 ATR > 6 pip — trending market filter ───────────────
+        h4_atr_pip = self._atr(h4_h, h4_l, h4_c, 14) / 0.0001
+        if h4_atr_pip < 6.0:
+            msg = ("🚫 L1 FAIL — H4 ATR=" + str(round(h4_atr_pip, 1)) +
+                   "p < 6.0p (choppy market, skip)")
             log.info(instrument + ": " + msg)
-            reasons.append(msg)
-            return score, "NONE", " | ".join(reasons)
+            return 1, "NONE", " | ".join(reasons) + " | " + msg
+        reasons.append("✅ L1 H4 ATR=" + str(round(h4_atr_pip, 1)) + "p OK")
+
+        # ── L2: H1 alignment — price above/below EMA20 AND EMA50 ──────
+        h1_c, h1_h, h1_l, _ = self._fetch_candles(instrument, "H1", 30)
+        if len(h1_c) < 10:
+            return 1, "NONE", " | ".join(reasons) + " | Not enough H1 data"
+
+        h1_ema20   = self._ema(h1_c, 20)[-1]
+        h1_ema50   = self._ema(h1_c, 50)[-1]
+        h1_rsi     = self._rsi(h1_c, 14)
+        h1_atr_pip = self._atr(h1_h, h1_l, h1_c, 14) / 0.0001
+        h1_price   = h1_c[-1]
+
+        if h1_atr_pip < 4.5:
+            msg = ("🚫 L2 FAIL — H1 ATR=" + str(round(h1_atr_pip, 1)) +
+                   "p < 4.5p (session quiet)")
+            return 1, "NONE", " | ".join(reasons) + " | " + msg
+
+        if not (30 < h1_rsi < 70):
+            msg = ("🚫 L2 FAIL — H1 RSI=" + str(round(h1_rsi, 1)) +
+                   " extreme (skip)")
+            return 1, "NONE", " | ".join(reasons) + " | " + msg
+
+        # Price must be on correct side of BOTH EMA20 and EMA50
+        bull_h1 = (h1_price > h1_ema20) and (h1_price > h1_ema50)
+        bear_h1 = (h1_price < h1_ema20) and (h1_price < h1_ema50)
+
+        if direction == "BUY" and not bull_h1:
+            msg = ("L2 FAIL — H1 not above both EMAs: price=" +
+                   str(round(h1_price, 5)) +
+                   " EMA20=" + str(round(h1_ema20, 5)) +
+                   " EMA50=" + str(round(h1_ema50, 5)))
+            return 1, "NONE", " | ".join(reasons) + " | " + msg
+        if direction == "SELL" and not bear_h1:
+            msg = ("L2 FAIL — H1 not below both EMAs: price=" +
+                   str(round(h1_price, 5)) +
+                   " EMA20=" + str(round(h1_ema20, 5)) +
+                   " EMA50=" + str(round(h1_ema50, 5)))
+            return 1, "NONE", " | ".join(reasons) + " | " + msg
+
+        reasons.append("✅ L2 H1 aligned EMA20=" + str(round(h1_ema20, 5)) +
+                       " EMA50=" + str(round(h1_ema50, 5)) +
+                       " RSI=" + str(round(h1_rsi, 1)) +
+                       " ATR=" + str(round(h1_atr_pip, 1)) + "p")
+
+        # ── L3: M15 ongoing EMA trend + tighter RSI ───────────────────
+        m15_c, m15_h, m15_l, _ = self._fetch_candles(instrument, "M15", 30)
+        if len(m15_c) < 10:
+            return 2, "NONE", " | ".join(reasons) + " | Not enough M15 data"
+
+        m15_ema9  = self._ema(m15_c, 9)[-1]
+        m15_ema21 = self._ema(m15_c, 21)[-1]
+        m15_rsi   = self._rsi(m15_c, 14)
+        m15_atr_p = self._atr(m15_h, m15_l, m15_c, 14) / 0.0001
+
+        if m15_atr_p < 4.5:
+            msg = ("🚫 L3 FAIL — M15 ATR=" + str(round(m15_atr_p, 1)) +
+                   "p < 4.5p")
+            return 2, "NONE", " | ".join(reasons) + " | " + msg
+
+        # Tighter RSI: 38–62 (filters out late/overextended entries)
+        if not (38 < m15_rsi < 62):
+            msg = ("🚫 L3 FAIL — M15 RSI=" + str(round(m15_rsi, 1)) +
+                   " outside 38–62")
+            return 2, "NONE", " | ".join(reasons) + " | " + msg
+
+        m15_bull = m15_ema9 > m15_ema21
+        m15_bear = m15_ema9 < m15_ema21
+
+        if direction == "BUY" and not m15_bull:
+            msg = ("L3 FAIL — M15 EMA9=" + str(round(m15_ema9, 5)) +
+                   " < EMA21=" + str(round(m15_ema21, 5)))
+            return 2, "NONE", " | ".join(reasons) + " | " + msg
+        if direction == "SELL" and not m15_bear:
+            msg = ("L3 FAIL — M15 EMA9=" + str(round(m15_ema9, 5)) +
+                   " > EMA21=" + str(round(m15_ema21, 5)))
+            return 2, "NONE", " | ".join(reasons) + " | " + msg
+
+        reasons.append("✅ L3 M15 EMA9=" + str(round(m15_ema9, 5)) +
+                       (" > " if m15_bull else " < ") +
+                       "EMA21=" + str(round(m15_ema21, 5)) +
+                       " RSI=" + str(round(m15_rsi, 1)))
+
+        # ── L4: M5 entry — close vs EMA9 + strong body + RSI ──────────
+        m5_c, m5_h, m5_l, m5_o = self._fetch_candles(instrument, "M5", 15)
+        if len(m5_c) < 5:
+            return 3, "NONE", " | ".join(reasons) + " | Not enough M5 data"
+
+        m5_ema9    = self._ema(m5_c, 9)[-1]
+        m5_rsi     = self._rsi(m5_c, 14)
+        last_c     = m5_c[-1]
+        last_o     = m5_o[-1]
+        last_h     = m5_h[-1]
+        last_l     = m5_l[-1]
+        candle_rng = max(last_h - last_l, 0.00001)
+
+        # M5 RSI — not overextended on entry
+        if not (35 < m5_rsi < 65):
+            msg = ("L4 FAIL — M5 RSI=" + str(round(m5_rsi, 1)) +
+                   " outside 35–65")
+            return 3, "NONE", " | ".join(reasons) + " | " + msg
+
+        # Body ≥50% of range in direction
+        bull_body = (last_c > last_o) and \
+                    ((last_c - last_l) / candle_rng >= 0.50)
+        bear_body = (last_c < last_o) and \
+                    ((last_h - last_c) / candle_rng >= 0.50)
+
+        # Close on correct side of M5 EMA9
+        bull_ema9 = last_c > m5_ema9
+        bear_ema9 = last_c < m5_ema9
+
+        if direction == "BUY" and bull_body and bull_ema9:
+            reasons.append("✅ L4 M5 BUY close=" + str(round(last_c, 5)) +
+                           " > EMA9=" + str(round(m5_ema9, 5)) +
+                           " body=" + str(round(
+                               (last_c - last_l) / candle_rng * 100)) + "%" +
+                           " RSI=" + str(round(m5_rsi, 1)))
+        elif direction == "SELL" and bear_body and bear_ema9:
+            reasons.append("✅ L4 M5 SELL close=" + str(round(last_c, 5)) +
+                           " < EMA9=" + str(round(m5_ema9, 5)) +
+                           " body=" + str(round(
+                               (last_h - last_c) / candle_rng * 100)) + "%" +
+                           " RSI=" + str(round(m5_rsi, 1)))
         else:
-            reasons.append("✅ ATR OK: H1 ATR=" + str(round(h1_atr_pip, 1)) + "p")
+            msg = ("L4 FAIL — M5 EMA9=" + str(round(m5_ema9, 5)) +
+                   " close=" + str(round(last_c, 5)) +
+                   " bull_body=" + str(bull_body) +
+                   " bear_body=" + str(bear_body) +
+                   " bull_ema9=" + str(bull_ema9) +
+                   " bear_ema9=" + str(bear_ema9) +
+                   " RSI=" + str(round(m5_rsi, 1)))
+            return 3, "NONE", " | ".join(reasons) + " | " + msg
 
-        # ── L1: H1 DUAL EMA ALIGNMENT — EMA21 + EMA50 ───────────────────
-        h1_ema21 = self._ema(h1_c, 21)[-1]
-        h1_ema50 = self._ema(h1_c, 50)[-1]
-        h1_close = h1_c[-1]
-
-        bull_h1 = (h1_close > h1_ema21) and (h1_ema21 > h1_ema50)
-        bear_h1 = (h1_close < h1_ema21) and (h1_ema21 < h1_ema50)
-
-        if direction == "BUY" and bull_h1:
-            reasons.append("✅ L1 H1 BULL stack: price>" + str(round(h1_ema21, 5)) + ">EMA50=" + str(round(h1_ema50, 5)))
-            score = 2
-        elif direction == "SELL" and bear_h1:
-            reasons.append("✅ L1 H1 BEAR stack: price<" + str(round(h1_ema21, 5)) + "<EMA50=" + str(round(h1_ema50, 5)))
-            score = 2
-        else:
-            msg = ("L1 FAIL — H1 EMAs not aligned: price=" + str(round(h1_close, 5)) +
-                   " EMA21=" + str(round(h1_ema21, 5)) + " EMA50=" + str(round(h1_ema50, 5)))
-            log.info(instrument + ": " + msg)
-            reasons.append(msg)
-            return score, "NONE", " | ".join(reasons)
-
-        # ── L2: M15 IMPULSE CANDLE BREAK ─────────────────────────────────
-        m15_c, m15_h, m15_l, m15_o = self._fetch_candles(instrument, "M15", 20)
-        if len(m15_c) < 8:
-            log.info(instrument + ": L2 SKIP — not enough M15 data (" + str(len(m15_c)) + ")")
-            return score, "NONE", " | ".join(reasons) + " | Not enough M15 data"
-
-        lookback       = 5
-        recent_highs   = m15_h[-lookback-1:-1]
-        recent_lows    = m15_l[-lookback-1:-1]
-        structure_high = max(recent_highs)
-        structure_low  = min(recent_lows)
-        last_close     = m15_c[-1]
-        last_open      = m15_o[-1]
-        last_high      = m15_h[-1]
-        last_low       = m15_l[-1]
-        candle_range   = max(last_high - last_low, 0.00001)
-
-        bull_body_m15 = (last_close > last_open) and ((last_close - last_low) / candle_range >= 0.50)
-        bear_body_m15 = (last_close < last_open) and ((last_high - last_close) / candle_range >= 0.50)
-
-        bull_break = (last_close > structure_high) and (last_close <= structure_high + 0.00080) and bull_body_m15
-        bear_break = (last_close < structure_low)  and (last_close >= structure_low  - 0.00080) and bear_body_m15
-
-        if direction == "BUY" and bull_break:
-            reasons.append(
-                "✅ L2 M15 impulse UP close=" + str(round(last_close, 5)) +
-                " > high=" + str(round(structure_high, 5)) +
-                " body=" + str(round((last_close - last_low) / candle_range * 100)) + "%"
-            )
-            score = 3
-        elif direction == "SELL" and bear_break:
-            reasons.append(
-                "✅ L2 M15 impulse DOWN close=" + str(round(last_close, 5)) +
-                " < low=" + str(round(structure_low, 5)) +
-                " body=" + str(round((last_high - last_close) / candle_range * 100)) + "%"
-            )
-            score = 3
-        else:
-            msg = ("L2 FAIL — no M15 impulse: high=" + str(round(structure_high, 5)) +
-                   " low=" + str(round(structure_low, 5)) +
-                   " close=" + str(round(last_close, 5)) +
-                   " bull_body=" + str(bull_body_m15) + " bear_body=" + str(bear_body_m15))
-            log.info(instrument + ": " + msg)
-            reasons.append(msg)
-            return score, "NONE", " | ".join(reasons)
-
-        # ── FIX-A: L2 PASSED → save to state, wait for L3 next scan ─────
-        if state is not None:
-            state["l2_pending"] = {
-                "instrument": instrument,
-                "direction":  direction,
-                "timestamp":  datetime.now(timezone.utc).isoformat(),
-            }
-            log.info(
-                instrument + ": ✅ L2 FIRED (" + direction + ") — "
-                "saved to state, checking L3 on next scan(s) for up to " +
-                str(L2_EXPIRY_MINUTES) + " min"
-            )
-            reasons.append("⏳ L2 confirmed — waiting for L3 pullback entry (next scan)...")
-            return score, "NONE", " | ".join(reasons)
-
-        # Stateless fallback
-        return self._check_l3_only(instrument, direction, score, reasons, state=None)
-
-    # ─────────────────────────────────────────────────────────────────────
-    def _check_l3_only(self, instrument, direction, score_so_far, reasons, state=None):
-        """
-        Called on the scan(s) AFTER L2 fires.
-        Checks M5 RSI(7) pullback to EMA13, then runs both VETOs.
-        Clears l2_pending from state and returns score=4 + direction on success.
-        """
-        score = score_so_far
-
-        # ── L3: M5 RSI(7) ENTRY TIMING + EMA13 TOUCH ────────────────────
-        m5_c, m5_h, m5_l, m5_o = self._fetch_candles(instrument, "M5", 50)
-        if len(m5_c) < 15:
-            log.info(instrument + ": L3 SKIP — not enough M5 data (" + str(len(m5_c)) + ")")
-            return score, "NONE", " | ".join(reasons) + " | Not enough M5 data"
-
-        ema13    = self._ema(m5_c, 13)[-1]
-        rsi7     = self._rsi(m5_c, 7)
-        m5_close = m5_c[-1]
-        m5_open  = m5_o[-1]
-        m5_high  = m5_h[-1]
-        m5_low   = m5_l[-1]
-        m5_range = max(m5_high - m5_low, 0.00001)
-
-        MIN_M5_RANGE = 0.00015  # 2.5 pips min candle
-
-        bull_m5_body = (m5_close > m5_open) and ((m5_close - m5_low) / m5_range >= 0.50) and (m5_range >= MIN_M5_RANGE)
-        bear_m5_body = (m5_close < m5_open) and ((m5_high - m5_close) / m5_range >= 0.50) and (m5_range >= MIN_M5_RANGE)
-
-        ema_tol         = 0.00020  # 1.0 pip tolerance
-        recent_lows_m5  = m5_l[-3:-1]
-        recent_highs_m5 = m5_h[-3:-1]
-        bull_pb = any(l <= ema13 + ema_tol for l in recent_lows_m5)
-        bear_pb = any(h >= ema13 - ema_tol for h in recent_highs_m5)
-
-        # FIX-B: Loosened RSI thresholds (was 42/58 → now 52/48)
-        RSI_BUY_MAX  = 58
-        RSI_SELL_MIN = 42
-
-        bull_rsi = rsi7 < RSI_BUY_MAX
-        bear_rsi = rsi7 > RSI_SELL_MIN
-
-        if direction == "BUY" and bull_pb and bull_m5_body and bull_rsi:
-            reasons.append(
-                "✅ L3 M5 entry: EMA13=" + str(round(ema13, 5)) +
-                " RSI7=" + str(round(rsi7, 1)) +
-                " bounce body=" + str(round((m5_close - m5_low) / m5_range * 100)) + "%"
-            )
-            score = 4
-        elif direction == "SELL" and bear_pb and bear_m5_body and bear_rsi:
-            reasons.append(
-                "✅ L3 M5 entry: EMA13=" + str(round(ema13, 5)) +
-                " RSI7=" + str(round(rsi7, 1)) +
-                " bounce body=" + str(round((m5_high - m5_close) / m5_range * 100)) + "%"
-            )
-            score = 4
-        else:
-            msg = (
-                "L3 FAIL — EMA13=" + str(round(ema13, 5)) +
-                " RSI7=" + str(round(rsi7, 1)) +
-                " (need <" + str(RSI_BUY_MAX) + " buy / >" + str(RSI_SELL_MIN) + " sell)" +
-                " bull_pb=" + str(bull_pb) + " bear_pb=" + str(bear_pb) +
-                " bull_body=" + str(bull_m5_body) + " bear_body=" + str(bear_m5_body)
-            )
-            log.info(instrument + ": " + msg)
-            reasons.append(msg)
-            return score, "NONE", " | ".join(reasons)
-
-        # ── VETO 1: H1 EMA200 HARD BLOCK ────────────────────────────────
-        h1_long_c, _, _, _ = self._fetch_candles(instrument, "H1", 210)
-        if len(h1_long_c) >= 200:
-            h1_ema200 = self._ema(h1_long_c, 200)[-1]
-            price_now = m5_c[-1]
-            if direction == "BUY" and price_now < h1_ema200:
-                msg = "🚫 VETO1 H1 EMA200=" + str(round(h1_ema200, 5)) + " price below — no BUY"
-                log.info(instrument + ": " + msg)
-                reasons.append(msg)
-                return score, "NONE", " | ".join(reasons)
-            elif direction == "SELL" and price_now > h1_ema200:
-                msg = "🚫 VETO1 H1 EMA200=" + str(round(h1_ema200, 5)) + " price above — no SELL"
-                log.info(instrument + ": " + msg)
-                reasons.append(msg)
-                return score, "NONE", " | ".join(reasons)
-            else:
-                reasons.append("✅ VETO1 pass EMA200=" + str(round(h1_ema200, 5)))
-        else:
-            log.warning("Not enough H1 for EMA200 (" + str(len(h1_long_c)) + ") — veto skipped")
-            reasons.append("⚠️ EMA200 unavailable — veto skipped")
-
-        # ── VETO 2: M30 COUNTER-TREND BLOCK ──────────────────────────────
-        m30_c, m30_h, m30_l, m30_o = self._fetch_candles(instrument, "M30", 10)
-        if len(m30_c) >= 4:
-            counter_trend_count = 0
-            for i in range(-3, 0):
-                c_rng = max(m30_h[i] - m30_l[i], 0.00001)
-                if direction == "BUY":
-                    if (m30_c[i] < m30_o[i]) and ((m30_h[i] - m30_c[i]) / c_rng >= 0.65):
-                        counter_trend_count += 1
-                else:
-                    if (m30_c[i] > m30_o[i]) and ((m30_c[i] - m30_l[i]) / c_rng >= 0.65):
-                        counter_trend_count += 1
-
-            if counter_trend_count >= 3:
-                msg = "🚫 VETO2 M30 counter-trend: 3/3 candles opposing " + direction
-                log.info(instrument + ": " + msg)
-                reasons.append(msg)
-                return score, "NONE", " | ".join(reasons)
-            else:
-                reasons.append("✅ VETO2 M30 ok: " + str(counter_trend_count) + "/3 counter candles")
-
-        # ── ALL PASSED → clear L2 pending, fire trade ────────────────────
-        if state is not None:
-            state.pop("l2_pending", None)
-            log.info(instrument + ": ✅ ALL 4 LAYERS PASSED — firing trade")
-
-        return score, direction, " | ".join(reasons)
+        # ── ALL 4 LAYERS PASSED ───────────────────────────────────────
+        log.info(instrument + ": ✅ ALL LAYERS PASSED — firing " + direction)
+        return 4, direction, " | ".join(reasons)
