@@ -1,11 +1,16 @@
-name: OANDA Demo 2 - Mean Reversion Bot
+name: OANDA EUR/USD V7-PLUS - Multi-Session Scalp
 
 on:
   schedule:
-    - cron: "*/5 21-23 * * 0"   # Sunday 21:00-23:59 UTC (Mon 5am-7am SGT market open)
-    - cron: "*/5 * * * 1-4"     # Mon-Thu all day UTC
-    - cron: "*/5 0-21 * * 5"    # Friday up to 21:00 UTC (Fri 11pm SGT market close)
-  workflow_dispatch:             # Manual trigger anytime
+    # Asian session: 01:00-06:00 UTC (09:00-14:00 SGT) Mon-Fri
+    - cron: "*/5 1-5 * * 1-5"
+    # London session: 07:00-12:00 UTC (15:00-20:00 SGT) Mon-Fri
+    - cron: "*/5 7-11 * * 1-5"
+    # NY session: 13:00-16:00 UTC (21:00-00:00 SGT) Mon-Thu
+    - cron: "*/5 13-15 * * 1-4"
+    # NY session Friday: only 13:xx UTC (bot self-stops before 14:00)
+    - cron: "*/5 13 * * 5"
+  workflow_dispatch:
 
 jobs:
   trade:
@@ -22,7 +27,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Mean Reversion Bot
+      # Restore bot state from previous run so session_trades/cooldown persist
+      - name: Restore bot state
+        uses: actions/cache@v4
+        with:
+          path: bot_state.json
+          key: bot-state-${{ github.ref }}
+          restore-keys: bot-state-
+
+      - name: Run Bot (single scan)
         env:
           OANDA_API_KEY:    ${{ secrets.OANDA_API_KEY }}
           OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
@@ -30,12 +43,21 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
 
+      # Save updated state for next run
+      - name: Save bot state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: bot_state.json
+          key: bot-state-${{ github.ref }}-${{ github.run_id }}
+
       - name: Save logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: demo2-logs-${{ github.run_number }}
+          name: bot-logs-${{ github.run_number }}
           path: |
+            bot_state.json
             trades_*.json
             performance_log.txt
           retention-days: 30
