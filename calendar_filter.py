@@ -6,17 +6,18 @@ No manual updates needed - works forever!
 
 What happens on news days:
 - 30 mins BEFORE news = bot pauses trading
-- During news          = bot pauses trading  
+- During news          = bot pauses trading
 - 30 mins AFTER news   = bot pauses trading
 - After 30 mins        = bot resumes normally!
 """
 
 import requests
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pytz
 
 log = logging.getLogger(__name__)
+
 
 class EconomicCalendar:
     def __init__(self):
@@ -27,9 +28,9 @@ class EconomicCalendar:
 
     def _fetch_events(self):
         """
-        Fetch this week events from ForexFactory
+        Fetch this week's events from ForexFactory.
         Free JSON feed - auto updates every week!
-        Cached per day to avoid too many requests
+        Cached per day to avoid too many requests.
         """
         now_sg    = datetime.now(self.sg_tz)
         today_str = now_sg.strftime("%Y-%m-%d")
@@ -81,9 +82,11 @@ class EconomicCalendar:
             self._cache       = high_impacts
             self._cached_date = today_str
 
-            log.info("Calendar loaded! " + str(len(high_impacts)) + " high impact events this week")
+            log.info("Calendar loaded! " + str(len(high_impacts)) +
+                     " high impact events this week")
             for e in high_impacts:
-                log.info("  " + e["currency"] + " " + e["title"] + " @ " + e["date"])
+                log.info("  " + e["currency"] + " " + e["title"] +
+                         " @ " + e["date"])
 
             return high_impacts
 
@@ -92,35 +95,71 @@ class EconomicCalendar:
             return []
 
     def _get_affected_currencies(self, instrument):
-        """Which currencies affect this instrument"""
-        affected = ["USD"]  # USD affects everything!
+        """Which currencies affect this instrument."""
+        affected = ["USD"]  # USD affects everything
         if "EUR" in instrument:
             affected.append("EUR")
         if "GBP" in instrument:
             affected.append("GBP")
         if "XAU" in instrument:
-            # Gold affected by ALL major currencies!
             affected.extend(["EUR", "GBP"])
         return affected
 
+    def _parse_event_utc(self, date_str):
+        """
+        Parse a ForexFactory date string to a UTC-aware datetime.
+        Format: "2026-03-07T13:30:00-0500"  (local time + UTC offset)
+        FIX: correctly convert local time to UTC using the offset.
+        """
+        if not date_str:
+            return None
+
+        try:
+            if "T" in date_str:
+                # Split at the timezone sign (last + or - after position 10)
+                clean = date_str[:19]   # "2026-03-07T13:30:00"
+                offset_str = date_str[19:]  # e.g. "-0500" or "+0000"
+
+                event_dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S")
+
+                # Parse offset and convert to UTC
+                if offset_str and (offset_str[0] in ("+", "-")):
+                    sign = 1 if offset_str[0] == "+" else -1
+                    raw  = offset_str[1:].replace(":", "")  # "0500" or "0530"
+                    h    = int(raw[:2])
+                    m    = int(raw[2:]) if len(raw) > 2 else 0
+                    # event_dt is local time; subtract offset to get UTC
+                    # e.g. local 13:30 at -0500 means UTC 18:30 => 13:30 - (-5h) = 18:30
+                    offset_td = timedelta(hours=h, minutes=m) * sign
+                    event_dt  = event_dt - offset_td
+                # Mark as UTC
+                return event_dt.replace(tzinfo=self.utc_tz)
+            else:
+                # Date only — use noon UTC as estimate
+                event_dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+                return event_dt.replace(hour=12, tzinfo=self.utc_tz)
+
+        except Exception as e:
+            log.warning("Date parse error: " + str(e) + " for: " + date_str)
+            return None
+
     def is_news_time(self, instrument="EUR_USD"):
         """
-        Check if current time is within news blackout window
+        Check if current time is within news blackout window.
 
         Returns: (is_blackout, reason)
-        
+
         Timeline:
-        T-30 mins → PAUSED (preparing for news)
-        T+00 mins → NEWS RELEASED (very volatile!)
-        T+30 mins → PAUSED (market digesting news)
-        T+31 mins → RESUMED (safe to trade again!)
+        T-30 mins -> PAUSED (preparing for news)
+        T+00 mins -> NEWS RELEASED (very volatile!)
+        T+30 mins -> PAUSED (market digesting news)
+        T+31 mins -> RESUMED (safe to trade again!)
         """
-        now_utc  = datetime.utcnow().replace(tzinfo=self.utc_tz)
+        now_utc  = datetime.now(timezone.utc)
         affected = self._get_affected_currencies(instrument)
         events   = self._fetch_events()
 
         if not events:
-            # API failed - allow trading but log warning
             log.warning("Calendar unavailable - trading without news filter!")
             return False, ""
 
@@ -128,43 +167,11 @@ class EconomicCalendar:
             if event["currency"] not in affected:
                 continue
 
+            event_utc = self._parse_event_utc(event.get("date", ""))
+            if event_utc is None:
+                continue
+
             try:
-                date_str = event.get("date", "")
-                if not date_str:
-                    continue
-
-                # Parse ForexFactory date format
-                # Format: "2026-03-07T13:30:00-0500"
-                try:
-                    if "T" in date_str:
-                        # Remove timezone offset and parse
-                        clean = date_str[:19]
-                        offset_str = date_str[19:]
-                        event_dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S")
-
-                        # Apply timezone offset
-                        if "+" in offset_str or (offset_str.startswith("-") and len(offset_str) > 1):
-                            sign = 1 if "+" in offset_str else -1
-                            offset_str = offset_str.replace("+", "").replace("-", "")
-                            if ":" in offset_str:
-                                h, m = offset_str.split(":")
-                            else:
-                                h = offset_str[:2]
-                                m = offset_str[2:] if len(offset_str) > 2 else "00"
-                            offset = timedelta(hours=int(h), minutes=int(m)) * sign
-                            event_dt = event_dt - offset  # Convert to UTC
-
-                        event_utc = event_dt.replace(tzinfo=self.utc_tz)
-                    else:
-                        # Date only - use noon UTC as estimate
-                        event_dt  = datetime.strptime(date_str[:10], "%Y-%m-%d")
-                        event_utc = event_dt.replace(hour=12, tzinfo=self.utc_tz)
-
-                except Exception as parse_err:
-                    log.warning("Date parse error: " + str(parse_err) + " for " + date_str)
-                    continue
-
-                # Check 30 min window
                 window_start = event_utc - timedelta(minutes=30)
                 window_end   = event_utc + timedelta(minutes=30)
 
@@ -173,13 +180,13 @@ class EconomicCalendar:
 
                     if mins_to > 0:
                         reason = (event["currency"] + " " + event["title"] +
-                                 " in " + str(mins_to) + " mins!")
+                                  " in " + str(mins_to) + " mins!")
                     elif mins_to == 0:
                         reason = (event["currency"] + " " + event["title"] +
-                                 " releasing NOW!")
+                                  " releasing NOW!")
                     else:
                         reason = (event["currency"] + " " + event["title"] +
-                                 " released " + str(abs(mins_to)) + " mins ago")
+                                  " released " + str(abs(mins_to)) + " mins ago")
 
                     log.warning("NEWS BLACKOUT: " + reason)
                     return True, reason
@@ -192,8 +199,7 @@ class EconomicCalendar:
 
     def get_today_summary(self):
         """
-        Get today high impact events for Telegram morning alert
-        Bot sends this at start of each session
+        Get today's high impact events for Telegram morning alert.
         """
         now_sg    = datetime.now(self.sg_tz)
         today_str = now_sg.strftime("%Y-%m-%d")
@@ -202,38 +208,28 @@ class EconomicCalendar:
         today_events = []
         for event in events:
             try:
-                event_date = event.get("date", "")[:10]
-                if event_date == today_str:
-                    today_events.append(event)
-            except:
+                event_utc = self._parse_event_utc(event.get("date", ""))
+                if event_utc is None:
+                    continue
+                # Convert UTC to SGT for date comparison
+                event_sgt = event_utc.astimezone(self.sg_tz)
+                if event_sgt.strftime("%Y-%m-%d") == today_str:
+                    today_events.append((event, event_sgt))
+            except Exception:
                 continue
 
         if not today_events:
             return "No high impact news today - safe to trade!"
 
-        # Convert times to SGT for display
         lines = ["High impact news TODAY:"]
-        for e in today_events:
-            try:
-                date_str = e.get("date", "")
-                if "T" in date_str:
-                    clean    = date_str[:19]
-                    event_dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S")
-                    # Add SGT offset (+8)
-                    sgt_dt   = event_dt + timedelta(hours=8)
-                    time_str = sgt_dt.strftime("%H:%M SGT")
-                else:
-                    time_str = "time TBC"
-
-                lines.append(e["currency"] + " " + e["title"] + " @ " + time_str)
-            except:
-                lines.append(e["currency"] + " " + e["title"])
-
+        for e, event_sgt in today_events:
+            time_str = event_sgt.strftime("%H:%M SGT")
+            lines.append(e["currency"] + " " + e["title"] + " @ " + time_str)
         lines.append("Bot pauses 30 mins before/after!")
         return "\n".join(lines)
 
     def get_week_summary(self):
-        """Get full week events - useful for Monday morning alert"""
+        """Get full week events - useful for Monday morning alert."""
         events = self._fetch_events()
         if not events:
             return "Calendar unavailable this week"
@@ -241,9 +237,14 @@ class EconomicCalendar:
         lines = ["High impact events this week:"]
         for e in events:
             try:
-                date_str = e.get("date", "")[:10]
+                event_utc = self._parse_event_utc(e.get("date", ""))
+                if event_utc:
+                    event_sgt = event_utc.astimezone(self.sg_tz)
+                    date_str  = event_sgt.strftime("%Y-%m-%d %H:%M SGT")
+                else:
+                    date_str = e.get("date", "")[:10]
                 lines.append(date_str + " " + e["currency"] + ": " + e["title"])
-            except:
+            except Exception:
                 continue
 
         return "\n".join(lines) if len(lines) > 1 else "No high impact events this week"
