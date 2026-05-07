@@ -1,72 +1,121 @@
-from __future__ import annotations
-
-from pathlib import Path
-
-from config_loader import DATA_DIR, SETTINGS_FILE, load_secrets, load_settings
-from state_utils import CALENDAR_CACHE_FILE
-
-
-def run_startup_checks() -> list[str]:
-    settings = load_settings()
-    secrets  = load_secrets()
-    warnings: list[str] = []
-
-    if not Path(DATA_DIR).exists():
-        warnings.append(f"DATA_DIR missing: {DATA_DIR}")
-    if not Path(SETTINGS_FILE).exists():
-        warnings.append(f"settings file missing: {SETTINGS_FILE}")
-    if not secrets.get("OANDA_ACCOUNT_ID"):
-        warnings.append("OANDA_ACCOUNT_ID not set; broker calls will fail until configured")
-    if not secrets.get("OANDA_API_KEY"):
-        warnings.append("OANDA_API_KEY not set; broker calls will fail until configured")
-    if not secrets.get("TELEGRAM_TOKEN") or not secrets.get("TELEGRAM_CHAT_ID"):
-        warnings.append("Telegram not fully configured; alerts will be skipped")
-    if int(settings.get("cycle_minutes", 5)) <= 0:
-        warnings.append("cycle_minutes must be > 0")
-
-    margin_safety = float(settings.get("margin_safety_factor", 0.6))
-    if not 0 < margin_safety <= 1:
-        warnings.append("margin_safety_factor must be between 0 and 1")
-    retry_safety = float(settings.get("margin_retry_safety_factor", 0.4))
-    if not 0 < retry_safety <= 1:
-        warnings.append("margin_retry_safety_factor must be between 0 and 1")
-    if retry_safety > margin_safety:
-        warnings.append("margin_retry_safety_factor should not exceed margin_safety_factor")
-
-    # Validate pairs configuration
-    pairs = settings.get("pairs", {})
-    if not pairs:
-        warnings.append("No pairs defined in settings[\"pairs\"] — bot will not trade")
-    else:
-        enabled = [k for k, v in pairs.items() if isinstance(v, dict) and v.get("enabled", True)]
-        if not enabled:
-            warnings.append("All pairs are disabled in settings[\"pairs\"] — bot will not trade")
-        for pair_name, pair_cfg in pairs.items():
-            if not isinstance(pair_cfg, dict) or not pair_cfg.get("enabled", True):
-                continue
-            pip = float(pair_cfg.get("pip_size", 0) or 0)
-            if pip <= 0:
-                warnings.append(f"pairs.{pair_name}.pip_size must be > 0")
-            # pip_size validation
-            pass  # SL/TP validated via pair_sl_tp config (fixed-pip mode)
-
-    if not CALENDAR_CACHE_FILE.exists():
-        warnings.append(
-            "calendar_cache.json not found — news filter will pass all trades until "
-            "the first successful calendar fetch completes. Resolves on the first cycle."
-        )
-
-    # global concurrent-trade cap sanity
-    max_total = int(settings.get("max_total_open_trades", 1))
-    if max_total < 0:
-        warnings.append("max_total_open_trades must be >= 0 (0 = disabled)")
-
-    # Tokyo session hour ordering
-    tok_s = int(settings.get("tokyo_session_start_hour", 8))
-    tok_e = int(settings.get("tokyo_session_end_hour",  15))
-    if tok_s >= tok_e:
-        warnings.append(
-            f"tokyo_session_start_hour ({tok_s}) must be < tokyo_session_end_hour ({tok_e})"
-        )
-
-    return warnings
+{
+  "bot_name": "Hybrid Scalp v1.0",
+  "_comment": "EUR/USD London+NY \u2014 Best of Fiber Scalp v2.1 + EURO-USD bot",
+  "demo_mode": true,
+  "enabled": true,
+  "pairs": {
+    "EUR_USD": {
+      "enabled": true,
+      "pip_size": 0.0001,
+      "spread_limits": {
+        "London": 1.5,
+        "US": 2.0
+      },
+      "max_concurrent_trades": 1
+    }
+  },
+  "_comment_signal": "Hybrid scoring: L0(H4)+ATR+L1(H1)+L2(M15)+L3(M5)+BON(ORB/CPR) = 0-6",
+  "signal_threshold": 4,
+  "score_risk_usd": {
+    "4": 30,
+    "5": 40,
+    "6": 50
+  },
+  "position_full_usd": 40,
+  "position_partial_usd": 30,
+  "max_units": 20000,
+  "min_trade_units": 1000,
+  "_comment_sl_tp": "EUR/USD: 18p SL / 30p TP = 1.67x RR. Break-even at 20p in profit.",
+  "pair_sl_tp": {
+    "EUR_USD": {
+      "sl_pips": 18,
+      "tp_pips": 30,
+      "pip_value_usd": 10.0,
+      "be_trigger_pips": 20
+    }
+  },
+  "min_rr_ratio": 1.6,
+  "_comment_sessions": "London 16-20 SGT primary. US 21-03 SGT secondary. Tokyo disabled.",
+  "session_only": true,
+  "session_thresholds": {
+    "Tokyo": 99,
+    "London": 4,
+    "US": 4
+  },
+  "london_session_start_hour": 16,
+  "london_session_end_hour": 20,
+  "us_session_start_hour": 21,
+  "us_session_end_hour": 23,
+  "us_session_early_end_hour": 3,
+  "tokyo_session_start_hour": 8,
+  "tokyo_session_end_hour": 15,
+  "dead_zone_start_hour": 4,
+  "dead_zone_end_hour": 15,
+  "_comment_risk": "Daily caps from Fiber Scalp. Win-stop + circuit breaker from EURO-USD bot.",
+  "max_losing_trades_day": 3,
+  "daily_risk_cap_usd": 120,
+  "max_trades_day": 20,
+  "max_trades_london": 6,
+  "max_trades_us": 6,
+  "max_losing_trades_session": 3,
+  "max_total_open_trades": 1,
+  "max_concurrent_trades": 1,
+  "loss_streak_cooldown_min": 30,
+  "sl_reentry_gap_min": 10,
+  "win_stop_per_day": true,
+  "_comment_circuit": "2 consecutive SL = 2 day pause OR smart flip resume (from EURO-USD bot).",
+  "circuit_breaker_enabled": true,
+  "circuit_breaker_consec_sl": 2,
+  "circuit_breaker_pause_days": 2,
+  "_comment_h1filter": "Score-aware H1 filter from Fiber Scalp v2.1.",
+  "h1_filter_enabled": true,
+  "h1_filter_mode": "score_aware",
+  "h1_ema_period": 21,
+  "_comment_orb": "ORB and CPR are bonus points (+1) in the hybrid scoring system.",
+  "orb_fresh_minutes": 60,
+  "orb_aging_minutes": 120,
+  "orb_formation_minutes": 15,
+  "_comment_be": "Break-even disabled \u2014 enable only after verifying modify_sl precision in demo logs.",
+  "breakeven_enabled": false,
+  "be_trigger_pips": 20,
+  "news_filter_enabled": true,
+  "news_block_before_min": 30,
+  "news_block_after_min": 30,
+  "news_lookahead_min": 120,
+  "news_medium_penalty_score": -1,
+  "friday_cutoff_hour_sgt": 22,
+  "friday_cutoff_minute_sgt": 0,
+  "spread_limits": {
+    "London": 1.5,
+    "US": 2.0
+  },
+  "margin_safety_factor": 0.6,
+  "margin_retry_safety_factor": 0.4,
+  "margin_rate_override": 0.0,
+  "auto_scale_on_margin_reject": true,
+  "telegram_show_margin": true,
+  "pip_size": 0.0001,
+  "atr_period": 14,
+  "m5_candle_count": 40,
+  "exhaustion_atr_mult": 3.0,
+  "trading_day_start_hour_sgt": 8,
+  "account_balance_override": 0,
+  "telegram_min_score_alert": 4,
+  "cycle_minutes": 5,
+  "daily_report_hour_sgt": 7,
+  "daily_report_minute_sgt": 50,
+  "weekly_report_hour_sgt": 8,
+  "weekly_report_minute_sgt": 0,
+  "weekly_export_hour_sgt": 8,
+  "weekly_export_minute_sgt": 5,
+  "monthly_report_hour_sgt": 8,
+  "monthly_report_minute_sgt": 0,
+  "db_retention_days": 90,
+  "calendar_prune_days_ahead": 21,
+  "startup_dedup_seconds": 90,
+  "tp2_rr_reference": 3.0,
+  "max_trades_tokyo": 10,
+  "rr_ratio": 1.67,
+  "_comment_ema": "Hybrid signals.py uses fixed EMA periods: H4=EMA50, H1=EMA21/EMA50, M5=EMA13, VETO=EMA200. ema_fast/slow_period not used.",
+  "score_6_risk_usd": 50
+}

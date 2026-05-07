@@ -1,109 +1,72 @@
-"""
-Telegram Alert System — Fiber Scalp v1.5
+from __future__ import annotations
 
-Retries up to 3 times on 5xx errors with exponential backoff.
-HTTP 429 (rate-limit) respects the Retry-After header.
-4xx errors (bad token, bad chat_id) are NOT retried — config errors.
-
-send_document() used for scheduled weekly trade history export.
-"""
-import logging
-import os
-import time
 from pathlib import Path
 
-import requests
-
-from config_loader import load_secrets, load_settings
-
-log = logging.getLogger(__name__)
-
-_MAX_RETRIES  = 3
-_RETRY_DELAYS = (2, 5)
-
-_DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+from config_loader import DATA_DIR, SETTINGS_FILE, load_secrets, load_settings
+from state_utils import CALENDAR_CACHE_FILE
 
 
-class TelegramAlert:
-    def __init__(self):
-        secrets      = load_secrets()
-        self.token   = secrets.get("TELEGRAM_TOKEN", "")
-        self.chat_id = secrets.get("TELEGRAM_CHAT_ID", "")
+def run_startup_checks() -> list[str]:
+    settings = load_settings()
+    secrets  = load_secrets()
+    warnings: list[str] = []
 
-    def send(self, message: str) -> bool:
-        if not self.token or not self.chat_id:
-            log.warning("Telegram not configured.")
-            return False
+    if not Path(DATA_DIR).exists():
+        warnings.append(f"DATA_DIR missing: {DATA_DIR}")
+    if not Path(SETTINGS_FILE).exists():
+        warnings.append(f"settings file missing: {SETTINGS_FILE}")
+    if not secrets.get("OANDA_ACCOUNT_ID"):
+        warnings.append("OANDA_ACCOUNT_ID not set; broker calls will fail until configured")
+    if not secrets.get("OANDA_API_KEY"):
+        warnings.append("OANDA_API_KEY not set; broker calls will fail until configured")
+    if not secrets.get("TELEGRAM_TOKEN") or not secrets.get("TELEGRAM_CHAT_ID"):
+        warnings.append("Telegram not fully configured; alerts will be skipped")
+    if int(settings.get("cycle_minutes", 5)) <= 0:
+        warnings.append("cycle_minutes must be > 0")
 
-        _bot_name = load_settings().get("bot_name", "Fiber Scalp v1.5")
-        url  = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        text = f"\U0001f916 {_bot_name}\n{chr(0x2500) * 22}\n{message}"
+    margin_safety = float(settings.get("margin_safety_factor", 0.6))
+    if not 0 < margin_safety <= 1:
+        warnings.append("margin_safety_factor must be between 0 and 1")
+    retry_safety = float(settings.get("margin_retry_safety_factor", 0.4))
+    if not 0 < retry_safety <= 1:
+        warnings.append("margin_retry_safety_factor must be between 0 and 1")
+    if retry_safety > margin_safety:
+        warnings.append("margin_retry_safety_factor should not exceed margin_safety_factor")
 
-        for attempt in range(_MAX_RETRIES):
-            try:
-                r = requests.post(
-                    url,
-                    data={"chat_id": self.chat_id, "text": text},
-                    timeout=10,
-                )
-                if r.status_code == 200:
-                    if attempt:
-                        log.info("Telegram sent (attempt %d).", attempt + 1)
-                    else:
-                        log.info("Telegram sent!")
-                    return True
+    # Validate pairs configuration
+    pairs = settings.get("pairs", {})
+    if not pairs:
+        warnings.append("No pairs defined in settings[\"pairs\"] — bot will not trade")
+    else:
+        enabled = [k for k, v in pairs.items() if isinstance(v, dict) and v.get("enabled", True)]
+        if not enabled:
+            warnings.append("All pairs are disabled in settings[\"pairs\"] — bot will not trade")
+        for pair_name, pair_cfg in pairs.items():
+            if not isinstance(pair_cfg, dict) or not pair_cfg.get("enabled", True):
+                continue
+            pip = float(pair_cfg.get("pip_size", 0) or 0)
+            if pip <= 0:
+                warnings.append(f"pairs.{pair_name}.pip_size must be > 0")
+            # pip_size validation
+            pass  # SL/TP validated via pair_sl_tp config (fixed-pip mode)
 
-                if r.status_code == 429:
-                    retry_after = int(r.headers.get("Retry-After", 5))
-                    log.warning(
-                        "Telegram rate-limited (429) — waiting %ds (attempt %d/%d).",
-                        retry_after, attempt + 1, _MAX_RETRIES,
-                    )
-                    time.sleep(retry_after)
-                    continue
+    if not CALENDAR_CACHE_FILE.exists():
+        warnings.append(
+            "calendar_cache.json not found — news filter will pass all trades until "
+            "the first successful calendar fetch completes. Resolves on the first cycle."
+        )
 
-                if r.status_code < 500:
-                    log.warning("Telegram %s (no retry): %s", r.status_code, r.text[:200])
-                    return False
+    # global concurrent-trade cap sanity
+    max_total = int(settings.get("max_total_open_trades", 1))
+    if max_total < 0:
+        warnings.append("max_total_open_trades must be >= 0 (0 = disabled)")
 
-                log.warning("Telegram 5xx (attempt %d/%d): HTTP %s",
-                            attempt + 1, _MAX_RETRIES, r.status_code)
-                if attempt < len(_RETRY_DELAYS):
-                    time.sleep(_RETRY_DELAYS[attempt])
+    # Tokyo session hour ordering
+    tok_s = int(settings.get("tokyo_session_start_hour", 8))
+    tok_e = int(settings.get("tokyo_session_end_hour",  15))
+    if tok_s >= tok_e:
+        warnings.append(
+            f"tokyo_session_start_hour ({tok_s}) must be < tokyo_session_end_hour ({tok_e})"
+        )
 
-            except requests.RequestException as exc:
-                log.warning("Telegram network error (attempt %d/%d): %s",
-                            attempt + 1, _MAX_RETRIES, exc)
-                if attempt < len(_RETRY_DELAYS):
-                    time.sleep(_RETRY_DELAYS[attempt])
-
-        log.error("Telegram failed after %d attempts.", _MAX_RETRIES)
-        return False
-
-    def send_document(self, file_path: Path, caption: str = "") -> bool:
-        """Send a file as a Telegram document attachment."""
-        if not self.token or not self.chat_id:
-            log.warning("Telegram not configured.")
-            return False
-        if not file_path.exists():
-            log.warning("send_document: file not found: %s", file_path)
-            return False
-
-        url = f"https://api.telegram.org/bot{self.token}/sendDocument"
-        try:
-            with open(file_path, "rb") as fh:
-                r = requests.post(
-                    url,
-                    data={"chat_id": self.chat_id, "caption": caption},
-                    files={"document": (file_path.name, fh, "application/json")},
-                    timeout=30,
-                )
-            if r.status_code == 200:
-                log.info("Telegram document sent: %s", file_path.name)
-                return True
-            log.warning("Telegram document failed: HTTP %s: %s",
-                        r.status_code, r.text[:200])
-            return False
-        except Exception as exc:
-            log.warning("Telegram document error: %s", exc)
-            return False
+    return warnings

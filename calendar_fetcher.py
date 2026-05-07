@@ -1,357 +1,371 @@
 """
-Forex Factory calendar fetcher for Fiber Scalp v1.5.
+analyze_trades.py — Fiber Scalp v1.5 — Performance Dashboard
+Run from the same folder as trade_history.json:
 
-Architecture-only improvements:
-- Uses /data/runtime_state.json cooldown tracking
-- Backs off after HTTP 429 responses
-- Avoids noisy warnings for expected next-week 404 responses
-- Keeps the existing calendar_cache.json if refresh is skipped or fails
-
-Strategy is unchanged. This only affects how often the news calendar is refreshed.
+    python analyze_trades.py              # all FILLED trades
+    python analyze_trades.py --all        # include FAILED orders too
+    python analyze_trades.py --last 30    # last 30 days only
 """
 
-from __future__ import annotations
-
 import json
-import logging
-import re
-from datetime import date, datetime, timedelta
-
+import sys
 import pytz
-import requests
+from pathlib import Path
+from state_utils import TRADE_HISTORY_FILE
+from collections import defaultdict
+from datetime import datetime, timedelta
 
-from config_loader import load_settings
-from state_utils import CALENDAR_CACHE_FILE, RUNTIME_STATE_FILE, load_json, save_json, parse_sgt_timestamp
+_SGT = pytz.timezone("Asia/Singapore")
 
-log = logging.getLogger(__name__)
+HISTORY_FILE = TRADE_HISTORY_FILE
 
-SGT = pytz.timezone("Asia/Singapore")
-CACHE_PATH = CALENDAR_CACHE_FILE
-FF_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-NEXT_WEEK_URL = "https://nfs.faireconomy.media/ff_calendar_nextweek.json"
-# Note: alternate CDN (cdn-nfs.faireconomy.media) does not resolve — removed
+# ─────────────────────────────────────────────────────────────
+# Load
+# ─────────────────────────────────────────────────────────────
 
-
-# currencies whose high/medium-impact events are
-# captured for the news filter — primary: EUR/USD (Fiber). Filter covers USD, GBP, EUR, JPY events.
-# All High-impact events are captured; Medium-impact ones apply a score
-# penalty rather than a hard block (controlled by news_medium_penalty_score).
-FOREX_CURRENCIES = {"USD", "GBP", "EUR", "JPY"}
-
-
-def _now_sgt() -> datetime:
-    return datetime.now(SGT)
-
-
-# _parse_sgt — canonical implementation lives in state_utils.parse_sgt_timestamp.
-# Alias kept so existing call sites in this file need no change.
-_parse_sgt = parse_sgt_timestamp
-
-
-def _load_runtime_state() -> dict:
-    state = load_json(RUNTIME_STATE_FILE, {})
-    return state if isinstance(state, dict) else {}
-
-
-def _save_runtime_state(state: dict) -> None:
-    save_json(RUNTIME_STATE_FILE, state)
-
-
-def _is_forex_relevant(title: str, country: str, impact: str) -> bool:
-    """Return True for any High or Medium-impact event for a traded currency.
-
-    For EUR/USD forex trading
-    (EUR_USD) any significant release for USD, GBP, EUR, JPY —
-    EUR or JPY can move our pairs, so we capture all of them without keyword
-    matching and let the news_filter module apply hard-block / soft-penalty logic.
-    """
-    if country.upper() not in FOREX_CURRENCIES:
-        return False
-    # FF feed returns 'High', 'Medium', 'Low' (capitalised) or legacy '3'/'red'
-    return impact.lower() in {"high", "medium", "3", "red", "medium-high"}
-
-
-def _date_fmt(date_str: str) -> str:
-    """Return the strptime format string that matches date_str, or the FF default."""
-    for fmt in ("%m-%d-%Y", "%Y-%m-%d", "%d-%m-%Y"):
+def load_trades(include_failed=False, last_days=None):
+    trades = []
+    if HISTORY_FILE.exists():
         try:
-            datetime.strptime(date_str, fmt)
-            return fmt
-        except ValueError:
-            continue
-    return "%m-%d-%Y"
+            data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                trades.extend(data)
+        except Exception as e:
+            print(f"⚠️  Could not read {HISTORY_FILE}: {e}")
 
+    if not include_failed:
+        trades = [t for t in trades if t.get("status") == "FILLED"]
 
-def _parse_ff_event(event: dict) -> dict | None:
-    """Parse a single Forex Factory event into a normalised calendar entry.
-
-    FF API date field formats seen in the wild:
-      New (current): "2026-03-18T14:00:00-04:00"  — ISO 8601 with UTC offset, time field empty
-      Legacy:        "03-18-2026"                   — date only, time in separate 'time' field
-
-    Both are handled. The ISO path takes priority because fromisoformat() will
-    raise ValueError on legacy date-only strings (no 'T' separator).
-    """
-    title    = event.get("title", "")
-    country  = event.get("country", "")
-    impact   = event.get("impact", "")
-    date_str = event.get("date", "")
-    time_str = event.get("time", "")
-
-    if not _is_forex_relevant(title, country, impact):
-        return None
-
-    dt_sgt = None
-
-    # ── PATH A: ISO 8601 datetime with embedded timezone (current FF API) ──
-    # Example: "2026-03-18T14:00:00-04:00"
-    # fromisoformat() returns a timezone-aware datetime — convert directly to SGT.
-    # The time field is empty in this format; the date field carries everything.
-    if "T" in date_str:
-        try:
-            dt_aware = datetime.fromisoformat(date_str)
-            dt_sgt   = dt_aware.astimezone(SGT)
-            log.debug(
-                "calendar_fetcher: [ISO] parsed %r | %s → %s SGT  impact=%r",
-                title, date_str, dt_sgt.strftime("%Y-%m-%d %H:%M"), impact,
-            )
-        except Exception as exc:
-            log.warning(
-                "calendar_fetcher: skipping relevant event — ISO datetime parse failed | "
-                "title=%r  date=%r  error=%s",
-                title, date_str, exc,
-            )
-            return None
-
-    # ── PATH B: Legacy date-only string + separate time field ──────────────
-    # Example date: "03-18-2026", time: "2:00pm"
-    else:
-        et_tz   = pytz.timezone("America/New_York")
-        dt_date = None
-        for fmt in ("%m-%d-%Y", "%Y-%m-%d", "%d-%m-%Y"):
+    if last_days:
+        cutoff = datetime.now(_SGT) - timedelta(days=last_days)
+        filtered = []
+        for t in trades:
+            ts = t.get("timestamp_sgt", "")
             try:
-                dt_date = datetime.strptime(date_str, fmt)
-                break
-            except ValueError:
-                continue
+                dt = _SGT.localize(datetime.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+                if dt >= cutoff:
+                    filtered.append(t)
+            except Exception:
+                filtered.append(t)
+        trades = filtered
 
-        if dt_date is None:
-            log.warning(
-                "calendar_fetcher: skipping relevant event — unrecognised date format | "
-                "title=%r  date=%r  time=%r  impact=%r",
-                title, date_str, time_str, impact,
-            )
-            return None
+    # Sort chronologically
+    trades.sort(key=lambda t: t.get("timestamp_sgt", ""))
+    return trades
 
-        try:
-            if not time_str or time_str.lower() in {"all day", "tentative", ""}:
-                dt_naive = dt_date.replace(hour=8, minute=30)
-                log.debug(
-                    "calendar_fetcher: %r has no specific time (%r) — defaulting to 08:30 ET",
-                    title, time_str,
-                )
-            else:
-                # Normalise "2:00pm" → "2:00 PM" for strptime
-                time_clean = re.sub(r"([ap]m)", r" \1", time_str, flags=re.IGNORECASE).strip().upper()
-                dt_naive   = None
-                date_fmt   = _date_fmt(date_str)
-                for time_fmt in (f"{date_fmt} %I:%M %p", f"{date_fmt} %H:%M"):
-                    try:
-                        dt_naive = datetime.strptime(f"{date_str} {time_clean}", time_fmt)
-                        break
-                    except ValueError:
-                        try:
-                            dt_naive = datetime.strptime(f"{date_str} {time_str}", f"{date_fmt} %H:%M")
-                            break
-                        except ValueError:
-                            continue
-                if dt_naive is None:
-                    raise ValueError(f"no matching time format for time_str={time_str!r}")
 
-            dt_et  = et_tz.localize(dt_naive)
-            dt_sgt = dt_et.astimezone(SGT)
-            log.debug(
-                "calendar_fetcher: [legacy] parsed %r | %s ET → %s SGT  impact=%r",
-                title, dt_et.strftime("%Y-%m-%d %H:%M"), dt_sgt.strftime("%Y-%m-%d %H:%M"), impact,
-            )
-        except Exception as exc:
-            log.warning(
-                "calendar_fetcher: skipping relevant event — time parse failed | "
-                "title=%r  date=%r  time=%r  impact=%r  error=%s",
-                title, date_str, time_str, impact, exc,
-            )
-            return None
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
 
-    return {
-        "name":     title,
-        "currency": country.upper(),
-        "impact":   impact.lower(),   # preserve actual severity: "high" or "medium"
-        "time_sgt": dt_sgt.strftime("%Y-%m-%d %H:%M"),
+def classify(trade):
+    """Return 'WIN', 'LOSS', or 'OPEN' for a trade."""
+    pnl = trade.get("realized_pnl_usd")
+    if pnl is None:
+        return "OPEN"
+    return "WIN" if pnl > 0 else "LOSS"
+
+
+def r_multiple(trade):
+    """
+    Estimate R multiple from pnl vs estimated_risk_usd.
+    Returns None for open trades or missing data.
+    """
+    pnl  = trade.get("realized_pnl_usd")
+    risk = trade.get("estimated_risk_usd")
+    if pnl is None or not risk or risk == 0:
+        return None
+    return round(pnl / risk, 2)
+
+
+def max_streak(outcomes, target):
+    """Longest consecutive run of `target` ('WIN' or 'LOSS') in outcomes list."""
+    best = cur = 0
+    for o in outcomes:
+        if o == target:
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+    return best
+
+
+# ─────────────────────────────────────────────────────────────
+# Stats builders
+# ─────────────────────────────────────────────────────────────
+
+def overall_stats(trades):
+    closed = [t for t in trades if classify(t) != "OPEN"]
+    open_  = [t for t in trades if classify(t) == "OPEN"]
+
+    if not closed:
+        return None, open_
+
+    wins   = [t for t in closed if classify(t) == "WIN"]
+    losses = [t for t in closed if classify(t) == "LOSS"]
+
+    gross_profit = sum(t["realized_pnl_usd"] for t in wins)
+    gross_loss   = abs(sum(t["realized_pnl_usd"] for t in losses))
+    net_pnl      = gross_profit - gross_loss
+    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else float("inf")
+    win_rate      = round(len(wins) / len(closed) * 100, 1)
+
+    r_vals = [r_multiple(t) for t in closed if r_multiple(t) is not None]
+    avg_r  = round(sum(r_vals) / len(r_vals), 2) if r_vals else None
+
+    outcomes   = [classify(t) for t in closed]
+    max_loss_s = max_streak(outcomes, "LOSS")
+    max_win_s  = max_streak(outcomes, "WIN")
+
+    # Dates
+    first_date = closed[0].get("timestamp_sgt", "?")[:10]
+    last_date  = closed[-1].get("timestamp_sgt", "?")[:10]
+
+    stats = {
+        "total_trades":   len(closed),
+        "wins":           len(wins),
+        "losses":         len(losses),
+        "open":           len(open_),
+        "win_rate":       win_rate,
+        "profit_factor":  profit_factor,
+        "net_pnl":        round(net_pnl, 2),
+        "gross_profit":   round(gross_profit, 2),
+        "gross_loss":     round(gross_loss, 2),
+        "avg_r":          avg_r,
+        "max_win_streak": max_win_s,
+        "max_loss_streak":max_loss_s,
+        "first_trade":    first_date,
+        "last_trade":     last_date,
     }
+    return stats, open_
 
 
-def _fetch_ff_events(url: str, suppress_404: bool = False) -> tuple[list, int | None]:
-    try:
-        r = requests.get(url, timeout=15, headers={"User-Agent": "NinjaScalp/1.0"})
-        if r.status_code == 200:
-            data = r.json()
-            events = data if isinstance(data, list) else []
-            usd_events = [e for e in events if e.get("country", "").upper() == "USD"]
-            relevant_events = [e for e in events if e.get("country", "").upper() in FOREX_CURRENCIES]
-            impact_values = sorted({str(e.get("impact", "")) for e in relevant_events})
-            log.info(
-                "FF feed OK: %d total events | %d USD/GBP/EUR/JPY | impact values seen: %s",
-                len(events), len(relevant_events), impact_values,
-            )
-            return events, 200
-        if r.status_code == 404 and suppress_404:
-            log.info("FF next-week feed not yet published (HTTP 404) — keeping current cache.")
-            return [], 404
-        log.warning("Forex Factory fetch HTTP %s from %s", r.status_code, url)
-        return [], r.status_code
-    except Exception as exc:
-        log.warning("Forex Factory fetch error (%s): %s", url, exc)
-        return [], None
+def session_stats(trades):
+    """Win rate and P&L per macro session (London / US)."""
+    buckets = defaultdict(list)
+    for t in trades:
+        macro = t.get("macro_session", t.get("session", "Unknown"))
+        if classify(t) != "OPEN":
+            buckets[macro].append(t)
+
+    results = {}
+    for session, ts in sorted(buckets.items()):
+        wins  = [t for t in ts if classify(t) == "WIN"]
+        pnl   = sum(t["realized_pnl_usd"] for t in ts)
+        r_vals = [r_multiple(t) for t in ts if r_multiple(t) is not None]
+        avg_r  = round(sum(r_vals) / len(r_vals), 2) if r_vals else None
+        results[session] = {
+            "trades":    len(ts),
+            "win_rate":  round(len(wins) / len(ts) * 100, 1),
+            "net_pnl":   round(pnl, 2),
+            "avg_r":     avg_r,
+        }
+    return results
 
 
-def _load_existing_cache() -> list:
-    if not CACHE_PATH.exists():
-        return []
-    try:
-        with CACHE_PATH.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception as exc:
-        log.warning("Could not read existing calendar_cache.json: %s", exc)
-        return []
+def setup_stats(trades):
+    """Win rate per setup type (Top CPR Breakout, PDH Breakout, etc.)."""
+    buckets = defaultdict(list)
+    for t in trades:
+        setup = t.get("setup", "Unknown")
+        if classify(t) != "OPEN":
+            buckets[setup].append(t)
+
+    results = {}
+    for setup, ts in sorted(buckets.items()):
+        wins = [t for t in ts if classify(t) == "WIN"]
+        pnl  = sum(t["realized_pnl_usd"] for t in ts)
+        results[setup] = {
+            "trades":   len(ts),
+            "win_rate": round(len(wins) / len(ts) * 100, 1),
+            "net_pnl":  round(pnl, 2),
+        }
+    return results
 
 
-def _deduplicate(events: list) -> list:
-    seen = set()
-    out = []
-    for e in events:
-        key = (e.get("name", "").lower(), e.get("time_sgt", ""))
-        if key not in seen:
-            seen.add(key)
-            out.append(e)
-    return out
+def score_stats(trades):
+    """Win rate by signal score (3, 4, 5)."""
+    buckets = defaultdict(list)
+    for t in trades:
+        score = t.get("score")
+        if score is not None and classify(t) != "OPEN":
+            buckets[score].append(t)
+
+    results = {}
+    for score in sorted(buckets.keys()):
+        ts   = buckets[score]
+        wins = [t for t in ts if classify(t) == "WIN"]
+        results[score] = {
+            "trades":   len(ts),
+            "win_rate": round(len(wins) / len(ts) * 100, 1),
+        }
+    return results
 
 
-def _prune_old_events(events: list, days_ahead: int = 14) -> list:
-    now    = _now_sgt()
-    cutoff = now + timedelta(days=days_ahead)
-    kept   = []
-    for e in events:
-        try:
-            dt = SGT.localize(datetime.strptime(e["time_sgt"], "%Y-%m-%d %H:%M"))
-            if now <= dt <= cutoff:
-                kept.append(e)
-            # else: event is in the past or beyond 14 days — silently drop (expected)
-        except Exception as exc:
-            log.warning(
-                "calendar_fetcher: dropping cached event with unparseable time_sgt | "
-                "name=%r  time_sgt=%r  error=%s",
-                e.get("name"), e.get("time_sgt"), exc,
-            )
-    return kept
+def monthly_pnl(trades):
+    """Net P&L grouped by month."""
+    buckets = defaultdict(float)
+    for t in trades:
+        pnl = t.get("realized_pnl_usd")
+        if pnl is None:
+            continue
+        month = t.get("timestamp_sgt", "????-??")[:7]
+        buckets[month] += pnl
+    return {m: round(v, 2) for m, v in sorted(buckets.items())}
 
 
-def _should_skip_fetch(settings: dict, state: dict) -> tuple[bool, str | None]:
-    now = _now_sgt()
-    next_allowed = _parse_sgt(state.get("calendar_next_allowed_fetch_sgt"))
-    if next_allowed and now < next_allowed:
-        return True, f"backoff_active_until={next_allowed.strftime('%Y-%m-%d %H:%M:%S')}"
+# ─────────────────────────────────────────────────────────────
+# Display
+# ─────────────────────────────────────────────────────────────
 
-    interval_min = int(settings.get("calendar_fetch_interval_min", 60))
-    last_success = _parse_sgt(state.get("calendar_last_success_sgt"))
-    if last_success and (now - last_success) < timedelta(minutes=interval_min):
-        return True, f"cooldown_active_last_success={last_success.strftime('%Y-%m-%d %H:%M:%S')}"
+SEP  = "─" * 50
+SEP2 = "═" * 50
 
-    return False, None
+def bar(value, max_val, width=20, fill="█", empty="░"):
+    if max_val == 0:
+        return empty * width
+    filled = int(round(value / max_val * width))
+    return fill * filled + empty * (width - filled)
 
 
-def run_fetch() -> bool:
-    log.info("Fetching economic calendar from Forex Factory...")
+def print_report(trades, label="ALL TIME"):
+    stats, open_trades = overall_stats(trades)
 
-    settings = load_settings()
-    state = _load_runtime_state()
-    now = _now_sgt()
-    state["calendar_last_attempt_sgt"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n{SEP2}")
+    print(f"  📊  CPR GOLD BOT — PERFORMANCE REPORT")
+    print(f"  Period: {label}")
+    print(SEP2)
 
-    skip, reason = _should_skip_fetch(settings, state)
-    if skip:
-        state["calendar_last_fetch_result"] = f"skipped:{reason}"
-        _save_runtime_state(state)
-        log.info("Skipping calendar refresh — %s", reason)
-        return False
+    if not stats:
+        print("\n  ⚠️  No closed trades found yet.")
+        if open_trades:
+            print(f"  {len(open_trades)} trade(s) currently open / pending.")
+        print(f"\n  Run the bot and collect some trades first!\n")
+        return
 
-    today_weekday = now.weekday()
-    # suppress next-week 404 on all weekdays (Mon–Fri).
-    # The feed is only reliably published on weekends. The alternate CDN
-    # (cdn-nfs.faireconomy.media) was confirmed unreachable — removed.
-    suppress_nextweek_404 = today_weekday < 5  # Mon–Fri
+    # ── Overall ──────────────────────────────────────────────
+    print(f"\n  📈  OVERALL  ({stats['first_trade']} → {stats['last_trade']})")
+    print(SEP)
+    print(f"  Total trades    : {stats['total_trades']}  "
+          f"({stats['wins']}W / {stats['losses']}L"
+          + (f" / {stats['open']}open)" if stats['open'] else ")"))
+    print(f"  Win rate        : {stats['win_rate']}%")
+    print(f"  Profit factor   : {stats['profit_factor']}")
+    print(f"  Net P&L         : ${stats['net_pnl']:+.2f}  "
+          f"(Gross profit ${stats['gross_profit']:.2f} | Loss ${stats['gross_loss']:.2f})")
+    if stats['avg_r']:
+        print(f"  Avg R           : {stats['avg_r']}R")
+    print(f"  Max win streak  : {stats['max_win_streak']}")
+    print(f"  Max loss streak : {stats['max_loss_streak']}")
 
-    this_week, status_this = _fetch_ff_events(FF_URL)
-    next_week, status_next = _fetch_ff_events(NEXT_WEEK_URL, suppress_404=suppress_nextweek_404)
+    # ── Session breakdown ────────────────────────────────────
+    sess = session_stats(trades)
+    if sess:
+        print(f"\n  🌍  BY SESSION")
+        print(SEP)
+        best  = max(sess, key=lambda s: sess[s]["win_rate"])
+        worst = min(sess, key=lambda s: sess[s]["win_rate"])
+        max_wr = max(v["win_rate"] for v in sess.values())
 
-    all_raw = this_week + next_week
+        for name, s in sess.items():
+            tag = "  ← BEST " if name == best else ("  ← WORST" if name == worst else "")
+            b   = bar(s["win_rate"], max_wr)
+            r_str = f"  avg {s['avg_r']}R" if s['avg_r'] else ""
+            print(f"  {name:<16} {b}  {s['win_rate']:>5.1f}%  "
+                  f"({s['trades']} trades, ${s['net_pnl']:+.2f}){r_str}{tag}")
 
-    if status_this == 429 or status_next == 429:
-        retry_after_min = int(settings.get("calendar_retry_after_min", 15))
-        next_allowed = now + timedelta(minutes=retry_after_min)
-        state["calendar_last_fetch_result"] = "rate_limited_429"
-        state["calendar_next_allowed_fetch_sgt"] = next_allowed.strftime("%Y-%m-%d %H:%M:%S")
-        _save_runtime_state(state)
-        log.warning("Calendar fetch rate-limited (HTTP 429) — backing off until %s SGT.", next_allowed.strftime("%Y-%m-%d %H:%M:%S"))
-        return False
+        print(f"\n  Best session  : {best}")
+        print(f"  Worst session : {worst}")
 
-    if not all_raw:
-        state["calendar_last_fetch_result"] = "no_events_kept_existing_cache"
-        _save_runtime_state(state)
-        log.warning("No events fetched — keeping existing calendar_cache.json unchanged.")
-        return False
+    # ── Setup breakdown ──────────────────────────────────────
+    setups = setup_stats(trades)
+    if setups:
+        print(f"\n  🎯  BY SETUP")
+        print(SEP)
+        max_wr = max(v["win_rate"] for v in setups.values()) if setups else 1
+        for name, s in setups.items():
+            b = bar(s["win_rate"], max_wr)
+            print(f"  {name:<26} {b}  {s['win_rate']:>5.1f}%  "
+                  f"({s['trades']} trades, ${s['net_pnl']:+.2f})")
 
-    parsed = [e for e in (_parse_ff_event(ev) for ev in all_raw) if e is not None]
-    log.info("Parsed %d forex-relevant events from %d total", len(parsed), len(all_raw))
+    # ── Score breakdown ──────────────────────────────────────
+    scores = score_stats(trades)
+    if scores:
+        print(f"\n  🔢  BY SIGNAL SCORE")
+        print(SEP)
+        max_wr = max(v["win_rate"] for v in scores.values()) if scores else 1
+        for score, s in scores.items():
+            b = bar(s["win_rate"], max_wr)
+            print(f"  Score {score}   {b}  {s['win_rate']:>5.1f}%  ({s['trades']} trades)")
 
-    if not parsed:
-        # Diagnostic: show ALL relevant-currency high/medium-impact events in the
-        # feed so the operator can see which titles exist vs what was captured.
-        _relevant_impacts = {"high", "medium", "3", "red", "medium-high"}
-        relevant_high = [
-            f"{e.get('title', '')} [{e.get('country','')} {e.get('impact', '')}]"
-            for e in all_raw
-            if e.get("country", "").upper() in FOREX_CURRENCIES
-            and str(e.get("impact", "")).lower() in _relevant_impacts
-        ]
-        state["calendar_last_fetch_result"] = "no_relevant_events_kept_existing_cache"
-        _save_runtime_state(state)
-        log.warning(
-            "calendar_fetcher: 0 events parsed. USD/GBP/EUR/JPY high/medium-impact titles in feed: %s",
-            relevant_high[:20],
-        )
-        log.warning("No relevant events found in feed — keeping existing cache.")
-        return False
+    # ── Monthly P&L ──────────────────────────────────────────
+    monthly = monthly_pnl(trades)
+    if len(monthly) > 1:
+        print(f"\n  📅  MONTHLY P&L")
+        print(SEP)
+        max_abs = max(abs(v) for v in monthly.values()) or 1
+        for month, pnl in monthly.items():
+            sign = "+" if pnl >= 0 else "-"
+            b    = bar(abs(pnl), max_abs, fill="█" if pnl >= 0 else "▒")
+            print(f"  {month}   {b}  ${pnl:+.2f}")
 
-    existing = _load_existing_cache()
-    merged = _deduplicate(parsed + existing)
-    _prune_days = int(settings.get("calendar_prune_days_ahead", 21))
-    pruned = _prune_old_events(merged, days_ahead=_prune_days)
-    pruned.sort(key=lambda e: e.get("time_sgt", ""))
+    # ── Verdict ──────────────────────────────────────────────
+    print(f"\n{SEP2}")
+    print("  🩺  VERDICT")
+    print(SEP)
+    pf   = stats["profit_factor"]
+    wr   = stats["win_rate"]
+    n    = stats["total_trades"]
+    mls  = stats["max_loss_streak"]
 
-    save_json(CACHE_PATH, pruned)
+    if n < 30:
+        print(f"  ⚠️  Sample too small ({n} trades). Need 50–100 for reliable conclusions.")
+    else:
+        if pf >= 1.3 and wr >= 48:
+            print(f"  ✅  System looks healthy (PF {pf}, WR {wr}%). Keep running.")
+        elif pf >= 1.0:
+            print(f"  🟡  Marginal edge (PF {pf}, WR {wr}%). Watch for improvement.")
+        else:
+            print(f"  🔴  Negative expectancy (PF {pf}). Review signal logic before live.")
 
-    state["calendar_last_success_sgt"] = now.strftime("%Y-%m-%d %H:%M:%S")
-    state["calendar_last_fetch_result"] = f"success:{len(pruned)}_events"
-    state.pop("calendar_next_allowed_fetch_sgt", None)
-    _save_runtime_state(state)
+    if mls >= 6:
+        print(f"  ⚠️  Max losing streak is {mls} — check drawdown rules.")
+    elif mls >= 4:
+        print(f"  ℹ️  Max losing streak: {mls} — within normal range.")
 
-    log.info("calendar_cache.json updated — %d events saved (next %d days).", len(pruned), _prune_days)
-    return True
+    if sess:
+        worst_wr = sess[worst]["win_rate"]
+        if worst_wr < 40 and sess[worst]["trades"] >= 10:
+            print(f"  💡  Consider disabling {worst} session (WR {worst_wr}% over "
+                  f"{sess[worst]['trades']} trades).")
 
+    print(SEP2)
+    print()
+
+
+# ─────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    success = run_fetch()
-    if not success:
-        log.warning("Falling back to existing calendar_cache.json")
+    include_failed = "--all"   in sys.argv
+    last_days      = None
+
+    if "--last" in sys.argv:
+        idx = sys.argv.index("--last")
+        try:
+            last_days = int(sys.argv[idx + 1])
+        except (IndexError, ValueError):
+            print("Usage: python analyze_trades.py --last <days>")
+            sys.exit(1)
+
+    trades = load_trades(include_failed=include_failed, last_days=last_days)
+
+    if not trades:
+        print("\n⚠️  No trades found.")
+        print(f"   Expected file: {HISTORY_FILE.resolve()}")
+        print("   Make sure you run this from the same folder as trade_history.json\n")
+        sys.exit(0)
+
+    label = f"LAST {last_days} DAYS" if last_days else "ALL TIME"
+    print_report(trades, label=label)

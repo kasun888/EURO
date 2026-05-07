@@ -1,138 +1,269 @@
+"""Lightweight SQLite persistence for the re-architected CPR bot.
+
+Used for observability and durability only. It does not alter signal generation
+or trade decision logic.
+"""
+from __future__ import annotations
+
 import json
-import logging
-from datetime import datetime, timedelta
+import sqlite3
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterator
 
-import pytz
+from config_loader import DATA_DIR
 
-from state_utils import CALENDAR_CACHE_FILE
-
-log = logging.getLogger(__name__)
-
-# Default penalty applied to signal score when a medium-impact news event
-# is active. Negative value intentionally reduces score.
-# Configurable via settings.json: "news_medium_penalty_score": -1
-DEFAULT_MEDIUM_PENALTY = -1
+DB_PATH = Path(DATA_DIR) / "fiber_scalp.db"
 
 
-class NewsFilter:
-    """Classify USD/GBP events and decide hard block vs soft penalty.
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    V2.0 logic:
-    - Major events: hard block within configured window
-    - Medium events: no hard block, apply soft score penalty when nearby
-    - Minor/irrelevant events: ignore
 
-    The medium penalty score is now configurable via settings.json
-    (key: news_medium_penalty_score, default: -1).
-    """
+class Database:
+    def __init__(self, db_path: Path | None = None):
+        self.db_path = Path(db_path or DB_PATH)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
 
-    MAJOR_KEYWORDS = [
-        "fomc", "non-farm", "nfp", "powell", "rate decision",
-        "fed chair", "federal reserve",
-    ]
-    MEDIUM_KEYWORDS = [
-        "cpi", "core cpi", "pce", "core pce", "unemployment",
-        "jobless claims",
-    ]
+    def connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-    def __init__(self, before_minutes: int = 30, after_minutes: int = 30,
-                 lookahead_minutes: int = 120, medium_penalty: int = DEFAULT_MEDIUM_PENALTY):
-        self.before_minutes    = before_minutes
-        self.after_minutes     = after_minutes
-        self.lookahead_minutes = lookahead_minutes
-        self.medium_penalty    = int(medium_penalty)
-        self.sg_tz = pytz.timezone("Asia/Singapore")
-        self.path = CALENDAR_CACHE_FILE
+    def _init_db(self) -> None:
+        with self.connect() as conn:
+            conn.executescript(
+                """
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    state_key TEXT PRIMARY KEY,
+                    state_value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
-    def classify_event(self, event: dict) -> str | None:
-        name     = str(event.get("name", "")).lower()
-        currency = str(event.get("currency", "")).upper()
-        impact   = str(event.get("impact", "")).lower()
+                CREATE TABLE IF NOT EXISTS cycle_runs (
+                    run_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    status TEXT NOT NULL,
+                    summary_json TEXT,
+                    error_text TEXT
+                );
 
-        if currency != "USD":
-            return None
-        # Accept all impact values that calendar_fetcher passes through.
-        # FF feed now returns "high" / "medium" (lowercased on storage).
-        # Legacy values ("3", "red", "medium-high") kept for cache compatibility.
-        if impact not in {"high", "medium", "3", "red", "medium-high"}:
-            return None
+                CREATE TABLE IF NOT EXISTS signals_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    logged_at TEXT NOT NULL,
+                    pair TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    side TEXT,
+                    score REAL,
+                    payload_json TEXT
+                );
 
-        if any(k in name for k in self.MAJOR_KEYWORDS):
-            return "major"
-        if any(k in name for k in self.MEDIUM_KEYWORDS):
-            return "medium"
-        return None
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    created_at TEXT NOT NULL,
+                    pair TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    side TEXT,
+                    score REAL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT,
+                    broker_trade_id TEXT,
+                    note TEXT
+                );
 
-    def get_status_now(self) -> dict:
-        if not self.path.exists():
-            return {"blocked": False, "penalty": 0, "reason": "No calendar_cache.json found", "severity": None}
+                CREATE INDEX IF NOT EXISTS idx_signals_logged_at ON signals_log(logged_at);
+                CREATE INDEX IF NOT EXISTS idx_signals_pair_timeframe ON signals_log(pair, timeframe);
+                CREATE INDEX IF NOT EXISTS idx_trades_created_at ON trades(created_at);
+                CREATE INDEX IF NOT EXISTS idx_trades_pair_status ON trades(pair, status);
+                CREATE INDEX IF NOT EXISTS idx_cycles_started_at ON cycle_runs(started_at);
+                """
+            )
 
+    @contextmanager
+    def cycle(self) -> Iterator[str]:
+        run_id = uuid.uuid4().hex[:12]
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO cycle_runs (run_id, started_at, status) VALUES (?, ?, ?)",
+                (run_id, utc_now_iso(), "RUNNING"),
+            )
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                events = json.load(f)
-        except Exception as e:
-            log.warning("Could not read calendar_cache.json (%s) — skipping news check.", e)
-            return {"blocked": False, "penalty": 0, "reason": f"Calendar cache unreadable — news check skipped ({e})", "severity": None}
+            yield run_id
+        except Exception as exc:
+            self.finish_cycle(run_id, status="FAILED", error_text=str(exc))
+            raise
 
-        now = datetime.now(self.sg_tz)
-        active_medium = None
+    def finish_cycle(self, run_id: str, status: str, summary: dict | None = None, error_text: str | None = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE cycle_runs
+                SET finished_at = ?, status = ?, summary_json = ?, error_text = ?
+                WHERE run_id = ?
+                """,
+                (utc_now_iso(), status, json.dumps(summary or {}), error_text, run_id),
+            )
 
-        for event in events:
-            severity = self.classify_event(event)
-            if not severity:
-                continue
+    def upsert_state(self, key: str, value: Any) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO bot_state (state_key, state_value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(state_key) DO UPDATE SET
+                    state_value=excluded.state_value,
+                    updated_at=excluded.updated_at
+                """,
+                (key, json.dumps(value), utc_now_iso()),
+            )
 
-            event_time = self.sg_tz.localize(datetime.strptime(event["time_sgt"], "%Y-%m-%d %H:%M"))
-            window_start = event_time - timedelta(minutes=self.before_minutes)
-            window_end = event_time + timedelta(minutes=self.after_minutes)
-            if not (window_start <= now <= window_end):
-                continue
+    def get_state(self, key: str, default: Any = None) -> Any:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT state_value FROM bot_state WHERE state_key = ?",
+                (key,),
+            ).fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(row["state_value"])
+        except Exception:
+            return default
 
-            if severity == "major":
-                return {
-                    "blocked": True,
-                    "penalty": 0,
-                    "reason": f"Blocked by major news: {event['name']} at {event['time_sgt']} SGT",
-                    "severity": severity,
-                    "event": event,
-                }
-            if severity == "medium" and active_medium is None:
-                active_medium = {
-                    "blocked": False,
-                    "penalty": self.medium_penalty,
-                    "reason": f"Medium news nearby: {event['name']} at {event['time_sgt']} SGT",
-                    "severity": severity,
-                    "event": event,
-                }
+    def record_signal(self, signal: dict, timeframe: str = "H1", run_id: str | None = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO signals_log (run_id, logged_at, pair, timeframe, side, score, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    utc_now_iso(),
+                    signal.get("pair", ""),
+                    signal.get("timeframe", timeframe),
+                    signal.get("side"),
+                    signal.get("score"),
+                    json.dumps(signal),
+                ),
+            )
 
-        # Lookahead: scan for upcoming events in the next N minutes (informational only)
-        lookahead_events = []
-        for event in events:
-            severity = self.classify_event(event)
-            if not severity:
-                continue
+    def record_trade_attempt(self, signal: dict, ok: bool, note: str = "", broker_trade_id: str | None = None, run_id: str | None = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO trades (run_id, created_at, pair, timeframe, side, score, status, payload_json, broker_trade_id, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    utc_now_iso(),
+                    signal.get("pair", ""),
+                    signal.get("timeframe", "H1"),
+                    signal.get("side"),
+                    signal.get("score"),
+                    "PLACED" if ok else "FAILED",
+                    json.dumps(signal),
+                    broker_trade_id,
+                    note,
+                ),
+            )
+
+    def latest_cycles(self, limit: int = 20) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cycle_runs ORDER BY started_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def purge_old_data(self, retention_days: int = 90, vacuum: bool = False) -> dict[str, int | str]:
+        """Delete rows older than the rolling retention window.
+
+        This implements a true rolling cleanup window. Example: with
+        retention_days=90, once data exceeds 90 days, only rows older than the
+        latest 90-day window are removed. Newer rows remain intact.
+        """
+        retention_days = max(1, int(retention_days))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        cutoff_iso = cutoff.isoformat()
+
+        with self.connect() as conn:
+            cycle_deleted = conn.execute(
+                "DELETE FROM cycle_runs WHERE started_at < ?",
+                (cutoff_iso,),
+            ).rowcount
+            signal_deleted = conn.execute(
+                "DELETE FROM signals_log WHERE logged_at < ?",
+                (cutoff_iso,),
+            ).rowcount
+            trade_deleted = conn.execute(
+                "DELETE FROM trades WHERE created_at < ?",
+                (cutoff_iso,),
+            ).rowcount
+            conn.commit()
+            if vacuum:
+                conn.execute("VACUUM")
+
+        summary = {
+            "retention_days": retention_days,
+            "cutoff_utc": cutoff_iso,
+            "cycle_runs_deleted": int(cycle_deleted),
+            "signals_deleted": int(signal_deleted),
+            "trades_deleted": int(trade_deleted),
+            "vacuum": "yes" if vacuum else "no",
+        }
+        self.upsert_state("last_retention_cleanup", {
+            **summary,
+            "ran_at": utc_now_iso(),
+        })
+        return summary
+
+    def query_blocked_cycles(self, date_utc_prefix: str) -> dict[str, int]:
+        """Count SKIPPED cycle runs for a calendar day by block stage.
+
+        date_utc_prefix — e.g. '2026-03-18' (matches started_at LIKE '2026-03-18%')
+
+        Returns dict with keys: spread_guard, news_filter, signal_blocked, other.
+        Used by reporting.py to populate the blocked-cycles section of daily report.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT summary_json FROM cycle_runs
+                WHERE started_at LIKE ? AND status = 'SKIPPED'
+                """,
+                (f"{date_utc_prefix}%",),
+            ).fetchall()
+
+        counts: dict[str, int] = {
+            "spread_guard":   0,
+            "news_filter":    0,
+            "signal_blocked": 0,
+            "other":          0,
+        }
+        for row in rows:
             try:
-                event_time = self.sg_tz.localize(datetime.strptime(event["time_sgt"], "%Y-%m-%d %H:%M"))
+                summary = json.loads(row["summary_json"] or "{}")
+                stage   = summary.get("stage", "other")
+                reason  = summary.get("reason", "")
+                if stage == "spread_guard":
+                    counts["spread_guard"] += 1
+                elif stage == "news_filter":
+                    counts["news_filter"] += 1
+                elif stage in ("signal_validation", "position_sizing", "margin_cap") or reason in ("signal_blocked", "zero_units"):
+                    counts["signal_blocked"] += 1
+                elif stage not in ("daily_caps", "market_guard", "friday_cutoff",
+                                   "open_trade_guard", "window_guard", "cooldown_guard",
+                                   "enabled_check", "session_check"):
+                    counts["other"] += 1
             except Exception:
-                continue
-            window_start = event_time - timedelta(minutes=self.before_minutes)
-            window_end   = event_time + timedelta(minutes=self.after_minutes)
-            in_window = window_start <= now <= window_end
-            if not in_window:
-                lookahead_end = now + timedelta(minutes=self.lookahead_minutes)
-                if now <= event_time <= lookahead_end:
-                    mins_away = int((event_time - now).total_seconds() // 60)
-                    lookahead_events.append({
-                        "name": event["name"],
-                        "time_sgt": event["time_sgt"],
-                        "severity": severity,
-                        "mins_away": mins_away,
-                    })
-
-        result = active_medium or {"blocked": False, "penalty": 0, "reason": "No blocking news", "severity": None}
-        result["lookahead"] = lookahead_events
-        return result
-
-    def is_blocked_now(self) -> tuple[bool, str]:
-        status = self.get_status_now()
-        return bool(status.get("blocked")), str(status.get("reason", "No blocking news"))
+                pass
+        return counts

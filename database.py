@@ -1,269 +1,210 @@
-"""Lightweight SQLite persistence for the re-architected CPR bot.
-
-Used for observability and durability only. It does not alter signal generation
-or trade decision logic.
 """
-from __future__ import annotations
+circuit.py — Circuit Breaker + Win-Stop + Smart Flip
+======================================================
+From EURO-USD bot:
+  - 2 consecutive SL hits → check H4 trend direction
+  - If H4 flipped → resume immediately in new direction
+  - If H4 same → pause 2 days (choppy market)
+  - 1 win per day → stop trading (protect the profit)
 
-import json
-import sqlite3
-import uuid
-from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Iterator
+Used by bot.py after each trade closes.
+"""
+
+import logging
+import requests
+from datetime import datetime, timezone, timedelta
+
+log = logging.getLogger(__name__)
 
 from config_loader import DATA_DIR
-
-DB_PATH = Path(DATA_DIR) / "fiber_scalp.db"
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+_STATE_FILE = DATA_DIR / "circuit_state.json"
 
 
-class Database:
-    def __init__(self, db_path: Path | None = None):
-        self.db_path = Path(db_path or DB_PATH)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+def _load() -> dict:
+    from state_utils import load_json
+    return load_json(_STATE_FILE, {})
 
-    def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
 
-    def _init_db(self) -> None:
-        with self.connect() as conn:
-            conn.executescript(
-                """
-                PRAGMA journal_mode=WAL;
-                CREATE TABLE IF NOT EXISTS bot_state (
-                    state_key TEXT PRIMARY KEY,
-                    state_value TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
+def _save(state: dict):
+    from state_utils import save_json
+    save_json(_STATE_FILE, state)
 
-                CREATE TABLE IF NOT EXISTS cycle_runs (
-                    run_id TEXT PRIMARY KEY,
-                    started_at TEXT NOT NULL,
-                    finished_at TEXT,
-                    status TEXT NOT NULL,
-                    summary_json TEXT,
-                    error_text TEXT
-                );
 
-                CREATE TABLE IF NOT EXISTS signals_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT,
-                    logged_at TEXT NOT NULL,
-                    pair TEXT NOT NULL,
-                    timeframe TEXT NOT NULL,
-                    side TEXT,
-                    score REAL,
-                    payload_json TEXT
-                );
+# ── H4 direction check ────────────────────────────────────────────────────────
 
-                CREATE TABLE IF NOT EXISTS trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT,
-                    created_at TEXT NOT NULL,
-                    pair TEXT NOT NULL,
-                    timeframe TEXT NOT NULL,
-                    side TEXT,
-                    score REAL,
-                    status TEXT NOT NULL,
-                    payload_json TEXT,
-                    broker_trade_id TEXT,
-                    note TEXT
-                );
+def get_h4_direction(api_key: str, base_url: str) -> str | None:
+    """
+    Check current H4 trend via EMA50 with 3-bar confirmation.
+    Returns "BUY", "SELL", or None if unclear.
+    """
+    try:
+        import requests as _req
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        # FIX H4-RETRY: use retry session, not bare requests.get
+        _retries = Retry(total=3, backoff_factor=0.5,
+                         status_forcelist=[429, 500, 502, 503, 504],
+                         allowed_methods=["GET"])
+        _s = _req.Session()
+        _s.mount("https://", HTTPAdapter(max_retries=_retries))
 
-                CREATE INDEX IF NOT EXISTS idx_signals_logged_at ON signals_log(logged_at);
-                CREATE INDEX IF NOT EXISTS idx_signals_pair_timeframe ON signals_log(pair, timeframe);
-                CREATE INDEX IF NOT EXISTS idx_trades_created_at ON trades(created_at);
-                CREATE INDEX IF NOT EXISTS idx_trades_pair_status ON trades(pair, status);
-                CREATE INDEX IF NOT EXISTS idx_cycles_started_at ON cycle_runs(started_at);
-                """
+        headers = {"Authorization": f"Bearer {api_key}"}
+        url     = f"{base_url}/v3/instruments/EUR_USD/candles"
+        params  = {"count": "55", "granularity": "H4", "price": "M"}
+        r       = _s.get(url, headers=headers, params=params, timeout=10)
+        if r.status_code != 200:
+            return None
+        candles = [x for x in r.json()["candles"] if x["complete"]]
+        closes  = [float(x["mid"]["c"]) for x in candles]
+        if len(closes) < 52:
+            return None
+
+        # EMA50
+        seed = sum(closes[:50]) / 50
+        ema  = seed
+        mult = 2 / 51
+        for c in closes[50:]:
+            ema = (c - ema) * mult + ema
+
+        # 3-bar consistency
+        last3 = closes[-3:]
+        if all(c > ema for c in last3):
+            return "BUY"
+        elif all(c < ema for c in last3):
+            return "SELL"
+        return None
+    except Exception as e:
+        log.warning("get_h4_direction error: %s", e)
+        return None
+
+
+# ── Win-stop ──────────────────────────────────────────────────────────────────
+
+def is_win_stop_active(today: str) -> bool:
+    """
+    Returns True if we already got 1 win today and win_stop is triggered.
+    Uses circuit state file.
+    """
+    state = _load()
+    return state.get("win_stop_date") == today and state.get("wins_today", 0) >= 1
+
+
+def record_win(today: str, alert=None):
+    """Call after a TP hit. Sets win-stop for today."""
+    state = _load()
+    if state.get("win_stop_date") != today:
+        state["wins_today"] = 0
+        state["win_stop_date"] = today
+    state["wins_today"] = state.get("wins_today", 0) + 1
+    state["consec_losses"] = 0
+    _save(state)
+    if alert and state["wins_today"] == 1:
+        alert.send(
+            "✅ WIN-STOP TRIGGERED\n"
+            "First win of the day secured.\n"
+            "No more new trades today — protecting profit.\n"
+            "Resumes tomorrow at 08:00 SGT."
+        )
+    log.info("Win recorded. wins_today=%d — win-stop active for %s",
+             state["wins_today"], today)
+
+
+# ── Circuit breaker ───────────────────────────────────────────────────────────
+
+def is_circuit_breaker_active(settings: dict | None = None) -> tuple[bool, str]:
+    """
+    Returns (active: bool, reason: str).
+    FIX CB-FLAG: respects circuit_breaker_enabled setting.
+    """
+    s = settings or {}
+    if not s.get("circuit_breaker_enabled", True):
+        return False, ""   # explicitly disabled in settings
+    state = _load()
+    pause = state.get("pause_until")
+    if not pause:
+        return False, ""
+    try:
+        remaining = (datetime.fromisoformat(pause) -
+                     datetime.now(timezone.utc)).total_seconds()
+        if remaining > 0:
+            days = round(remaining / 86400, 1)
+            return True, f"Circuit breaker — {days}d remaining"
+        else:
+            # Expired — clear it
+            state.pop("pause_until", None)
+            _save(state)
+            log.info("Circuit breaker expired — resuming")
+            return False, ""
+    except Exception:
+        state.pop("pause_until", None)
+        _save(state)
+        return False, ""
+
+
+def record_sl(direction: str, api_key: str, base_url: str,
+              settings: dict, alert=None):
+    """
+    Call after each SL hit. Increments consecutive loss count.
+    If count reaches threshold → smart flip check → pause or resume.
+    """
+    state = _load()
+    consec = state.get("consec_losses", 0) + 1
+    # Read PREVIOUS direction BEFORE overwriting — needed for smart flip comparison
+    prev_direction = state.get("last_trade_direction", "")
+    state["consec_losses"]        = consec
+    state["last_trade_direction"] = direction
+    _save(state)
+
+    threshold  = int(settings.get("circuit_breaker_consec_sl", 2))
+    pause_days = int(settings.get("circuit_breaker_pause_days", 2))
+
+    if consec < threshold:
+        log.info("SL recorded. consec_losses=%d (threshold=%d)", consec, threshold)
+        return
+
+    # ── Smart flip detection (from EURO-USD bot) ───────────────────────────
+    last_dir   = prev_direction   # direction of the PREVIOUS trade (before this SL)
+    h4_dir_now = get_h4_direction(api_key, base_url)
+    log.info("Smart flip check — last=%s H4_now=%s", last_dir, h4_dir_now)
+
+    if h4_dir_now and last_dir and h4_dir_now != last_dir:
+        # Trend flipped — resume in new direction immediately
+        state["consec_losses"] = 0
+        state.pop("pause_until", None)
+        _save(state)
+        log.info("H4 FLIPPED %s→%s — resuming immediately", last_dir, h4_dir_now)
+        if alert:
+            alert.send(
+                f"🔄 TREND FLIP DETECTED\n"
+                f"H4: {last_dir} → {h4_dir_now}\n"
+                f"Resuming in new direction immediately.\n"
+                f"Market shifted — not choppy."
+            )
+    else:
+        # Same direction or unclear — genuine chop, pause
+        pause_until = datetime.now(timezone.utc) + timedelta(days=pause_days)
+        state["pause_until"]    = pause_until.isoformat()
+        state["consec_losses"]  = 0
+        _save(state)
+        log.warning("CIRCUIT BREAKER — H4 unchanged (%s). Pausing %d days.",
+                    h4_dir_now, pause_days)
+        if alert:
+            alert.send(
+                f"⛔ CIRCUIT BREAKER\n"
+                f"{consec} consecutive SL hits.\n"
+                f"H4 direction unchanged ({h4_dir_now or 'unclear'}).\n"
+                f"Pausing {pause_days} days — choppy market.\n"
+                f"Resumes automatically."
             )
 
-    @contextmanager
-    def cycle(self) -> Iterator[str]:
-        run_id = uuid.uuid4().hex[:12]
-        with self.connect() as conn:
-            conn.execute(
-                "INSERT INTO cycle_runs (run_id, started_at, status) VALUES (?, ?, ?)",
-                (run_id, utc_now_iso(), "RUNNING"),
-            )
-        try:
-            yield run_id
-        except Exception as exc:
-            self.finish_cycle(run_id, status="FAILED", error_text=str(exc))
-            raise
 
-    def finish_cycle(self, run_id: str, status: str, summary: dict | None = None, error_text: str | None = None) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                UPDATE cycle_runs
-                SET finished_at = ?, status = ?, summary_json = ?, error_text = ?
-                WHERE run_id = ?
-                """,
-                (utc_now_iso(), status, json.dumps(summary or {}), error_text, run_id),
-            )
-
-    def upsert_state(self, key: str, value: Any) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO bot_state (state_key, state_value, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(state_key) DO UPDATE SET
-                    state_value=excluded.state_value,
-                    updated_at=excluded.updated_at
-                """,
-                (key, json.dumps(value), utc_now_iso()),
-            )
-
-    def get_state(self, key: str, default: Any = None) -> Any:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT state_value FROM bot_state WHERE state_key = ?",
-                (key,),
-            ).fetchone()
-        if not row:
-            return default
-        try:
-            return json.loads(row["state_value"])
-        except Exception:
-            return default
-
-    def record_signal(self, signal: dict, timeframe: str = "H1", run_id: str | None = None) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO signals_log (run_id, logged_at, pair, timeframe, side, score, payload_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    utc_now_iso(),
-                    signal.get("pair", ""),
-                    signal.get("timeframe", timeframe),
-                    signal.get("side"),
-                    signal.get("score"),
-                    json.dumps(signal),
-                ),
-            )
-
-    def record_trade_attempt(self, signal: dict, ok: bool, note: str = "", broker_trade_id: str | None = None, run_id: str | None = None) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO trades (run_id, created_at, pair, timeframe, side, score, status, payload_json, broker_trade_id, note)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    utc_now_iso(),
-                    signal.get("pair", ""),
-                    signal.get("timeframe", "H1"),
-                    signal.get("side"),
-                    signal.get("score"),
-                    "PLACED" if ok else "FAILED",
-                    json.dumps(signal),
-                    broker_trade_id,
-                    note,
-                ),
-            )
-
-    def latest_cycles(self, limit: int = 20) -> list[dict]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM cycle_runs ORDER BY started_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    def purge_old_data(self, retention_days: int = 90, vacuum: bool = False) -> dict[str, int | str]:
-        """Delete rows older than the rolling retention window.
-
-        This implements a true rolling cleanup window. Example: with
-        retention_days=90, once data exceeds 90 days, only rows older than the
-        latest 90-day window are removed. Newer rows remain intact.
-        """
-        retention_days = max(1, int(retention_days))
-        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
-        cutoff_iso = cutoff.isoformat()
-
-        with self.connect() as conn:
-            cycle_deleted = conn.execute(
-                "DELETE FROM cycle_runs WHERE started_at < ?",
-                (cutoff_iso,),
-            ).rowcount
-            signal_deleted = conn.execute(
-                "DELETE FROM signals_log WHERE logged_at < ?",
-                (cutoff_iso,),
-            ).rowcount
-            trade_deleted = conn.execute(
-                "DELETE FROM trades WHERE created_at < ?",
-                (cutoff_iso,),
-            ).rowcount
-            conn.commit()
-            if vacuum:
-                conn.execute("VACUUM")
-
-        summary = {
-            "retention_days": retention_days,
-            "cutoff_utc": cutoff_iso,
-            "cycle_runs_deleted": int(cycle_deleted),
-            "signals_deleted": int(signal_deleted),
-            "trades_deleted": int(trade_deleted),
-            "vacuum": "yes" if vacuum else "no",
-        }
-        self.upsert_state("last_retention_cleanup", {
-            **summary,
-            "ran_at": utc_now_iso(),
-        })
-        return summary
-
-    def query_blocked_cycles(self, date_utc_prefix: str) -> dict[str, int]:
-        """Count SKIPPED cycle runs for a calendar day by block stage.
-
-        date_utc_prefix — e.g. '2026-03-18' (matches started_at LIKE '2026-03-18%')
-
-        Returns dict with keys: spread_guard, news_filter, signal_blocked, other.
-        Used by reporting.py to populate the blocked-cycles section of daily report.
-        """
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT summary_json FROM cycle_runs
-                WHERE started_at LIKE ? AND status = 'SKIPPED'
-                """,
-                (f"{date_utc_prefix}%",),
-            ).fetchall()
-
-        counts: dict[str, int] = {
-            "spread_guard":   0,
-            "news_filter":    0,
-            "signal_blocked": 0,
-            "other":          0,
-        }
-        for row in rows:
-            try:
-                summary = json.loads(row["summary_json"] or "{}")
-                stage   = summary.get("stage", "other")
-                reason  = summary.get("reason", "")
-                if stage == "spread_guard":
-                    counts["spread_guard"] += 1
-                elif stage == "news_filter":
-                    counts["news_filter"] += 1
-                elif stage in ("signal_validation", "position_sizing", "margin_cap") or reason in ("signal_blocked", "zero_units"):
-                    counts["signal_blocked"] += 1
-                elif stage not in ("daily_caps", "market_guard", "friday_cutoff",
-                                   "open_trade_guard", "window_guard", "cooldown_guard",
-                                   "enabled_check", "session_check"):
-                    counts["other"] += 1
-            except Exception:
-                pass
-        return counts
+def reset_consec_losses():
+    """
+    Reset consecutive loss counter.
+    NOTE: record_win() already calls this internally.
+    Only call this directly after a timeout-close or manual intervention.
+    FIX DBL-RESET: do NOT call this after record_win() — it's redundant.
+    """
+    state = _load()
+    state["consec_losses"] = 0
+    _save(state)

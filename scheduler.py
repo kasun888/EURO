@@ -1,343 +1,593 @@
+"""reporting.py — Fiber Scalp v1.5 Telegram Performance Reports
+
+Scheduled reports read from /data/trade_history.json; weekly export converts it to trade_history.csv before sending
+on the Railway persistent volume. No archive file needed — the 90-day rolling
+window covers all report periods.
+
+Schedule (Asia/Singapore timezone, managed by scheduler.py):
+  Monthly  — First Monday of each month at 08:00 SGT
+  Weekly   — Every Monday at 08:00 SGT  (covers Mon–Fri prior week)
+  Export   — Every Monday at 08:05 SGT  (sends trade_history.csv)
+  Daily    — Mon–Fri at 07:50 SGT
+
+Usage (called by scheduler.py):
+    from reporting import send_daily_report, send_weekly_report, send_monthly_report
+"""
 from __future__ import annotations
 
-import signal
-import sys
-import threading
-from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import csv
+import json
+import logging
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytz
-from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 
-from bot import run_bot_cycle
-from oanda_trader import OandaTrader
-from reporting import send_daily_report, send_weekly_report, send_monthly_report, send_weekly_export
+from state_utils import TRADE_HISTORY_FILE
 from telegram_alert import TelegramAlert
-from telegram_templates import msg_startup
-from config_loader import DATA_DIR, load_settings
-from database import Database
-from logging_utils import configure_logging, get_logger
-from startup_checks import run_startup_checks
+from telegram_templates import msg_daily_report, msg_weekly_report, msg_monthly_report
 
-configure_logging()
-logger = get_logger(__name__)
-SG_TZ = pytz.timezone('Asia/Singapore')
-
-# ── Health-check HTTP server ───────────────────────────────────────────────────
-# Railway (and other PaaS platforms) can poll GET /health to confirm the process
-# is alive. Returns 200 with a rich JSON body so health means "actually trading",
-# not just "process is running". GET /metrics returns Prometheus-style counters.
-
-_scheduler_ref: BlockingScheduler | None = None
-_process_start: float = 0.0
+log = logging.getLogger(__name__)
+SGT = pytz.timezone("Asia/Singapore")
 
 
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        import json as _json
-        import time as _time
-        from state_utils import load_json, RUNTIME_STATE_FILE
+# ── Data loading ───────────────────────────────────────────────────────────────
 
-        if self.path in ("/health", "/healthz"):
-            try:
-                state    = load_json(RUNTIME_STATE_FILE, {})
-                running  = bool(_scheduler_ref and _scheduler_ref.running)
-                uptime_s = int(_time.time() - _process_start) if _process_start else 0
-                body = _json.dumps({
-                    "status":             "ok" if running else "starting",
-                    "scheduler_running":  running,
-                    "last_cycle_started": state.get("last_cycle_started"),
-                    "last_cycle_status":  state.get("status"),
-                    "oanda_failures":     int(state.get("oanda_consecutive_failures", 0)),
-                    "uptime_s":           uptime_s,
-                }, separators=(",", ":")).encode()
-                # Always return 200 while the process is alive.
-                # Scheduler "not yet started" during warmup is normal — not a failure.
-                # Railway needs 200 to pass healthcheck; 503 causes deploy failure.
-                code = 200
-            except Exception as exc:
-                body = _json.dumps({"status": "error", "detail": str(exc)}).encode()
-                code = 500
+def _load_history() -> list:
+    """Load trade_history.json from /data. Returns [] on any error."""
+    if not TRADE_HISTORY_FILE.exists():
+        return []
+    try:
+        data = json.loads(TRADE_HISTORY_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception as exc:
+        log.warning("reporting: could not read trade_history.json: %s", exc)
+        return []
 
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
 
-        elif self.path == "/metrics":
-            try:
-                from state_utils import load_json, RUNTIME_STATE_FILE
-                import time as _time
-                state   = load_json(RUNTIME_STATE_FILE, {})
-                uptime  = int(_time.time() - _process_start) if _process_start else 0
-                lines   = [
-                    f'bot_uptime_seconds {uptime}',
-                    f'bot_scheduler_running {1 if (_scheduler_ref and _scheduler_ref.running) else 0}',
-                    f'bot_oanda_consecutive_failures {int(state.get("oanda_consecutive_failures", 0))}',
-                ]
-                body = "\n".join(lines).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; version=0.0.4")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception as exc:
-                self.send_response(500)
-                self.end_headers()
+def _parse_ts(ts: str | None) -> datetime | None:
+    """Parse a SGT timestamp string to an aware datetime, or None."""
+    if not ts:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return SGT.localize(datetime.strptime(ts, fmt))
+        except Exception:
+            pass
+    return None
 
+
+def _csv_cell(value):
+    """Return a CSV-safe scalar; nested dict/list values are stored as compact JSON."""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return value
+
+
+def _write_history_csv(history: list, csv_path: Path) -> None:
+    """Convert trade_history.json records to a flat CSV file for Telegram export."""
+    preferred = [
+        "timestamp_sgt", "mode", "instrument", "direction", "setup", "session",
+        "window", "macro_session", "score", "raw_score", "news_penalty",
+        "position_usd", "entry", "sl_price", "tp_price", "size",
+        "cpr_width_pct", "h1_trend", "h1_aligned", "h1_relation",
+        "max_pips_reached", "sl_usd", "tp_usd", "pip_size",
+        "estimated_risk_usd", "estimated_reward_usd", "spread_pips",
+        "stop_pips", "tp_pips", "trade_id", "status", "realized_pnl_usd",
+        "breakeven_moved", "details", "levels",
+    ]
+
+    rows = [r if isinstance(r, dict) else {"value": r} for r in history]
+    seen = {key for row in rows for key in row.keys()}
+    fieldnames = [key for key in preferred if key in seen]
+    fieldnames += sorted(key for key in seen if key not in fieldnames)
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames or ["no_records"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: _csv_cell(row.get(key, "")) for key in writer.fieldnames})
+
+
+def _filled(history: list) -> list:
+    """Return only FILLED trades with a realized PnL."""
+    return [
+        t for t in history
+        if t.get("status") == "FILLED" and isinstance(t.get("realized_pnl_usd"), (int, float))
+    ]
+
+
+def _trades_in_window(filled: list, start: datetime, end: datetime) -> list:
+    """Filter filled trades whose timestamp_sgt falls within [start, end)."""
+    result = []
+    for t in filled:
+        dt = _parse_ts(t.get("timestamp_sgt"))
+        if dt and start <= dt < end:
+            result.append(t)
+    return result
+
+
+# ── Stats builders ─────────────────────────────────────────────────────────────
+
+def _stats(trades: list) -> dict:
+    """Compute standard stats dict from a list of filled trades."""
+    if not trades:
+        return {
+            "count": 0, "wins": 0, "losses": 0,
+            "net_pnl": 0.0, "gross_profit": 0.0, "gross_loss": 0.0,
+            "win_rate": 0.0, "profit_factor": None,
+            "avg_r": None, "max_win_streak": 0, "max_loss_streak": 0,
+            "best_trade": None, "worst_trade": None,
+            "instant_sl_count": 0,
+        }
+
+    wins   = [t for t in trades if t["realized_pnl_usd"] > 0]
+    losses = [t for t in trades if t["realized_pnl_usd"] < 0]
+
+    gross_profit = sum(t["realized_pnl_usd"] for t in wins)
+    gross_loss   = abs(sum(t["realized_pnl_usd"] for t in losses))
+    net_pnl      = gross_profit - gross_loss
+    win_rate     = round(len(wins) / len(trades) * 100, 1) if trades else 0.0
+    pf           = round(gross_profit / gross_loss, 2) if gross_loss > 0 else None
+
+    # R-multiple (uses estimated_risk_usd added by C-01 fix)
+    r_vals = []
+    for t in trades:
+        risk = t.get("estimated_risk_usd")
+        if risk and risk > 0:
+            r_vals.append(round(t["realized_pnl_usd"] / risk, 2))
+    avg_r = round(sum(r_vals) / len(r_vals), 2) if r_vals else None
+
+    # Streaks
+    outcomes = ["W" if t["realized_pnl_usd"] > 0 else "L" for t in trades]
+    max_win_s = max_loss_s = cur = 0
+    prev = None
+    for o in outcomes:
+        if o == prev:
+            cur += 1
         else:
-            self.send_response(404)
-            self.end_headers()
+            cur = 1
+            prev = o
+        if o == "W":
+            max_win_s = max(max_win_s, cur)
+        else:
+            max_loss_s = max(max_loss_s, cur)
 
-    def log_message(self, format, *args):  # silence access logs
-        pass
+    # Best and worst individual trade
+    def _trade_summary(t):
+        raw_time = t.get("closed_at_sgt") or t.get("timestamp_sgt") or ""
+        hhmm = raw_time[11:16] if len(raw_time) >= 16 else raw_time
+        return {"pnl": round(t["realized_pnl_usd"], 2), "time": hhmm}
+
+    best_trade  = _trade_summary(max(trades, key=lambda t: t["realized_pnl_usd"]))
+    worst_trade = _trade_summary(min(trades, key=lambda t: t["realized_pnl_usd"]))
+
+    # Instant SL: a losing trade that closed within one candle (≤ cycle_minutes, ~5 min)
+    def _trade_duration_min(t) -> int | None:
+        open_ts  = t.get("timestamp_sgt", "")
+        close_ts = t.get("closed_at_sgt", "")
+        if not open_ts or not close_ts:
+            return None
+        try:
+            from datetime import datetime
+            fmt = "%Y-%m-%d %H:%M:%S"
+            return int((datetime.strptime(close_ts[:19], fmt) -
+                        datetime.strptime(open_ts[:19], fmt)).total_seconds() / 60)
+        except Exception:
+            return None
+
+    instant_sl_count = sum(
+        1 for t in losses
+        if (_trade_duration_min(t) or 999) <= 5
+    )
+
+    return {
+        "count":          len(trades),
+        "wins":           len(wins),
+        "losses":         len(losses),
+        "net_pnl":        round(net_pnl, 2),
+        "gross_profit":   round(gross_profit, 2),
+        "gross_loss":     round(gross_loss, 2),
+        "win_rate":       win_rate,
+        "profit_factor":  pf,
+        "avg_r":          avg_r,
+        "max_win_streak": max_win_s,
+        "max_loss_streak":max_loss_s,
+        "best_trade":     best_trade,
+        "worst_trade":    worst_trade,
+        "instant_sl_count": instant_sl_count,
+    }
 
 
-def _start_health_server(port: int = 8080) -> None:
-    """Start the health-check HTTP server in a background daemon thread."""
-    import os
-    port = int(os.environ.get("PORT", port))
+def _session_breakdown(trades: list) -> dict[str, dict]:
+    """Win rate + PnL per macro session."""
+    buckets: dict[str, list] = defaultdict(list)
+    for t in trades:
+        sess = t.get("macro_session") or t.get("session") or "Unknown"
+        buckets[sess].append(t)
+    result = {}
+    for sess, ts in sorted(buckets.items()):
+        wins = [t for t in ts if t["realized_pnl_usd"] > 0]
+        result[sess] = {
+            "count":    len(ts),
+            "wins":     len(wins),
+            "losses":   len(ts) - len(wins),
+            "win_rate": round(len(wins) / len(ts) * 100, 1),
+            "net_pnl":  round(sum(t["realized_pnl_usd"] for t in ts), 2),
+        }
+    return result
+
+
+def _setup_breakdown(trades: list) -> dict[str, dict]:
+    """Win rate + PnL per setup type."""
+    buckets: dict[str, list] = defaultdict(list)
+    for t in trades:
+        setup = t.get("setup") or "Unknown"
+        buckets[setup].append(t)
+    result = {}
+    for setup, ts in sorted(buckets.items()):
+        wins = [t for t in ts if t["realized_pnl_usd"] > 0]
+        result[setup] = {
+            "count":    len(ts),
+            "wins":     len(wins),
+            "losses":   len(ts) - len(wins),
+            "win_rate": round(len(wins) / len(ts) * 100, 1),
+            "net_pnl":  round(sum(t["realized_pnl_usd"] for t in ts), 2),
+        }
+    return result
+
+
+def _score_breakdown(trades: list) -> dict[int, dict]:
+    """Win rate per signal score."""
+    buckets: dict[int, list] = defaultdict(list)
+    for t in trades:
+        score = t.get("score")
+        if score is not None:
+            buckets[int(score)].append(t)
+    result = {}
+    for score in sorted(buckets.keys()):
+        ts   = buckets[score]
+        wins = [t for t in ts if t["realized_pnl_usd"] > 0]
+        result[score] = {
+            "count":    len(ts),
+            "win_rate": round(len(wins) / len(ts) * 100, 1),
+        }
+    return result
+
+
+# ── Window helpers ─────────────────────────────────────────────────────────────
+
+
+def _h1_breakdown(trades: list) -> dict | None:
+    """Return H1 filter split: aligned vs counter-trend stats.
+    Returns None if no trades have h1_aligned field recorded.
+    """
+    aligned_trades  = [t for t in trades if t.get("h1_aligned") is True]
+    counter_trades  = [t for t in trades if t.get("h1_aligned") is False]
+
+    if not aligned_trades and not counter_trades:
+        return None  # h1 data not recorded (old trades)
+
+    def _grp(grp):
+        wins   = sum(1 for t in grp if (t.get("realized_pnl_usd") or 0) > 0)
+        losses = sum(1 for t in grp if (t.get("realized_pnl_usd") or 0) < 0)
+        net    = round(sum(t.get("realized_pnl_usd") or 0 for t in grp), 2)
+        wr     = round(wins / len(grp) * 100, 1) if grp else 0.0
+        return {"count": len(grp), "wins": wins, "losses": losses,
+                "net_pnl": net, "win_rate": wr}
+
+    return {
+        "aligned": _grp(aligned_trades),
+        "counter": _grp(counter_trades),
+    }
+
+
+def _prior_trading_day(now: datetime) -> tuple[datetime, datetime]:
+    """Return (start, end) for the prior trading day in SGT.
+    On Monday, looks back to Friday. Skips Saturday/Sunday.
+    """
+    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day -= timedelta(days=1)
+    # Step back over weekend
+    while day.weekday() in (5, 6):
+        day -= timedelta(days=1)
+    return day, day + timedelta(days=1)
+
+
+def _current_week_window(now: datetime) -> tuple[datetime, datetime]:
+    """Return (Mon 00:00, now) for the current week."""
+    days_since_mon = now.weekday()
+    week_start = (now - timedelta(days=days_since_mon)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return week_start, now
+
+
+def _prior_week_window(now: datetime) -> tuple[datetime, datetime, str]:
+    """Return (Mon 00:00, Fri 23:59:59, label) for the prior Mon–Fri week."""
+    days_since_mon = now.weekday()
+    this_mon = (now - timedelta(days=days_since_mon)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    prior_mon = this_mon - timedelta(days=7)
+    prior_fri = this_mon - timedelta(seconds=1)
+    label = f"{prior_mon.strftime('%d %b')} – {prior_fri.strftime('%d %b %Y')}"
+    return prior_mon, this_mon, label
+
+
+def _current_month_window(now: datetime) -> tuple[datetime, datetime]:
+    """Return (1st of current month 00:00, now)."""
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return month_start, now
+
+
+def _prior_month_window(now: datetime) -> tuple[datetime, datetime, str]:
+    """Return (1st of prior month, 1st of current month, label)."""
+    first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_prior = first_this - timedelta(seconds=1)
+    first_prior = last_prior.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    label = first_prior.strftime("%B %Y")
+    return first_prior, first_this, label
+
+
+def _is_first_monday_of_month(now: datetime) -> bool:
+    """True if today (SGT) is the first Monday of the calendar month."""
+    return now.weekday() == 0 and now.day <= 7
+
+
+# ── Report senders ─────────────────────────────────────────────────────────────
+
+def send_daily_report() -> None:
+    """Send daily performance summary at 07:50 SGT.
+
+    Fires after US continuation closes (03:59 SGT), capturing the full
+    London + US trading day. Covers:
+      - Current trading day  (16:00 yesterday → 03:59 today)
+      - Session breakdown    (Tokyo / London / US merged)
+      - Month-to-date        (1st → now)
+      - Blocked cycles breakdown
+    """
     try:
-        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-        t = threading.Thread(target=server.serve_forever, daemon=True, name="health-server")
-        t.start()
-        logger.info("Health-check server listening on port %d — GET /health", port)
-    except Exception as exc:
-        logger.warning("Could not start health-check server on port %d: %s", port, exc)
+        from database import Database  # local import avoids circular at module level
+        now     = datetime.now(SGT)
+        history = _load_history()
+        filled  = _filled(history)
 
+        # Prior day
+        pd_start, pd_end   = _prior_trading_day(now)
+        pd_trades          = _trades_in_window(filled, pd_start, pd_end)
+        pd_stats           = _stats(pd_trades)
+        pd_label           = pd_start.strftime("%A %d %b")
 
-def run_db_retention_cleanup():
-    settings = load_settings()
-    retention_days = int(settings.get('db_retention_days', 90))
-    vacuum_weekly = bool(settings.get('db_vacuum_weekly', True))
-    is_weekly_vacuum_day = datetime.now(SG_TZ).weekday() == 6
+        # Week-to-date
+        wtd_start, wtd_end = _current_week_window(now)
+        wtd_trades         = _trades_in_window(filled, wtd_start, wtd_end)
+        wtd_stats          = _stats(wtd_trades)
 
-    logger.info('Starting DB retention cleanup | retention_days=%s | weekly_vacuum=%s', retention_days, vacuum_weekly)
-    try:
-        db = Database()
-        summary = db.purge_old_data(retention_days=retention_days, vacuum=bool(vacuum_weekly and is_weekly_vacuum_day))
-        logger.info('DB retention cleanup complete: %s', summary)
-    except Exception as exc:
-        logger.exception('DB retention cleanup failed: %s', exc)
+        # Month-to-date
+        mtd_start, mtd_end = _current_month_window(now)
+        mtd_trades         = _trades_in_window(filled, mtd_start, mtd_end)
+        mtd_stats          = _stats(mtd_trades)
 
-
-def main():
-    global _scheduler_ref, _process_start
-    import time as _time
-    _process_start = _time.time()
-
-    settings       = load_settings()
-    cycle_minutes  = int(settings.get('cycle_minutes', 5))
-    cleanup_hour   = int(settings.get('db_cleanup_hour_sgt', 0))
-    cleanup_minute = int(settings.get('db_cleanup_minute_sgt', 15))
-    retention_days = int(settings.get('db_retention_days', 90))
-
-    # Report schedule — configurable via settings.json
-    daily_report_hour    = int(settings.get('daily_report_hour_sgt',     7))  # 07:50 SGT — screenshot schedule
-    daily_report_minute  = int(settings.get('daily_report_minute_sgt',  50))
-    weekly_report_hour   = int(settings.get('weekly_report_hour_sgt',    8))
-    weekly_report_minute = int(settings.get('weekly_report_minute_sgt',  0))
-    monthly_report_hour  = int(settings.get('monthly_report_hour_sgt',   8))
-    monthly_report_minute= int(settings.get('monthly_report_minute_sgt', 0))
-    weekly_export_hour   = int(settings.get('weekly_export_hour_sgt',   8))
-    weekly_export_minute = int(settings.get('weekly_export_minute_sgt', 5))
-
-    # Singleton alert — constructed once, shared across all cycles.
-    # Avoids re-reading secrets + creating new HTTP sessions every 5 minutes.
-    _alert = TelegramAlert()
-
-    logger.info('%s — Scheduler starting', settings.get('bot_name', 'Fiber Scalp v1.5'))
-    logger.info('DATA_DIR : %s', DATA_DIR)
-    logger.info('Python   : %s', sys.version.split()[0])
-    for warning in run_startup_checks():
-        logger.warning(warning)
-
-    scheduler = BlockingScheduler(timezone=SG_TZ)
-    scheduler.add_job(
-        lambda: run_bot_cycle(alert=_alert),
-        IntervalTrigger(minutes=cycle_minutes),
-        id='trade_cycle',
-        name=f'{cycle_minutes}-min trade cycle',
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=60  # skip if > 60s late — prevents burst catch-up cycles,
-    )
-
-    scheduler.add_job(
-        run_db_retention_cleanup,
-        CronTrigger(hour=cleanup_hour, minute=cleanup_minute, timezone=SG_TZ),
-        id='db_retention_cleanup',
-        name=f'DB retention cleanup ({retention_days}-day rolling)',
-        max_instances=1,
-        coalesce=True,
-    )
-
-    # ── Telegram performance reports ───────────────────────────────────────────
-    # Monthly: first Monday of each month at monthly_report_hour SGT
-    # The first-Monday guard is enforced inside send_monthly_report() itself,
-    # so this job fires every Monday but only sends on the first Monday.
-    scheduler.add_job(
-        send_monthly_report,
-        CronTrigger(day_of_week='mon', hour=monthly_report_hour,
-                    minute=monthly_report_minute, timezone=SG_TZ),
-        id='monthly_report',
-        name='Monthly performance report (first Monday)',
-        max_instances=1,
-        coalesce=True,
-    )
-
-    # Weekly: every Monday at weekly_report_hour SGT (covers prior Mon–Fri)
-    scheduler.add_job(
-        send_weekly_report,
-        CronTrigger(day_of_week='mon', hour=weekly_report_hour,
-                    minute=weekly_report_minute, timezone=SG_TZ),
-        id='weekly_report',
-        name='Weekly performance report',
-        max_instances=1,
-        coalesce=True,
-    )
-
-    # Weekly export: Monday 08:05 SGT — sends trade_history.csv
-    scheduler.add_job(
-        send_weekly_export,
-        CronTrigger(day_of_week='mon', hour=weekly_export_hour,
-                    minute=weekly_export_minute, timezone=SG_TZ),
-        id='weekly_export',
-        name='Weekly trade history export',
-        max_instances=1,
-        coalesce=True,
-    )
-
-    # Daily: Mon–Fri at 07:50 SGT
-    scheduler.add_job(
-        send_daily_report,
-        CronTrigger(day_of_week='mon-fri', hour=daily_report_hour,
-                    minute=daily_report_minute, timezone=SG_TZ),
-        id='daily_report',
-        name='Daily performance report',
-        max_instances=1,
-        coalesce=True,
-    )
-
-    def _graceful_shutdown(signum, frame):
-        logger.info('Received signal %s — waiting for active cycle to finish (max 120 s)...', signum)
-        # wait=True lets any running trade cycle complete before exit,
-        # preventing a half-placed order that is never recorded locally.
-        # The thread + join(timeout) provides a hard 120 s safety cap.
-        t = threading.Thread(
-            target=lambda: scheduler.shutdown(wait=True),
-            daemon=True,
-            name="scheduler-shutdown",
+        # Open positions count (trades with no realized_pnl yet)
+        open_count = sum(
+            1 for t in _load_history()
+            if t.get("status") == "FILLED" and t.get("realized_pnl_usd") is None
         )
-        t.start()
-        t.join(timeout=120)
-        if t.is_alive():
-            logger.warning('Shutdown timeout reached (120 s) — forcing exit.')
-        raise SystemExit(0)
 
-    signal.signal(signal.SIGTERM, _graceful_shutdown)
-    signal.signal(signal.SIGINT, _graceful_shutdown)
+        # Blocked cycles from DB — use UTC date prefix matching prior trading day
+        blocked_spread = blocked_news = blocked_signal = 0
+        try:
+            db             = Database()
+            utc_prefix     = pd_start.astimezone(pytz.utc).strftime("%Y-%m-%d")
+            blocked_counts = db.query_blocked_cycles(utc_prefix)
+            blocked_spread  = blocked_counts.get("spread_guard", 0)
+            blocked_news    = blocked_counts.get("news_filter", 0)
+            blocked_signal  = blocked_counts.get("signal_blocked", 0)
+        except Exception as exc:
+            log.warning("Could not query blocked cycles: %s", exc)
 
-    logger.info('Jobs scheduled:')
-    logger.info('  Trade cycle    — every %s minutes', cycle_minutes)
-    logger.info('  DB cleanup     — daily at %02d:%02d Asia/Singapore', cleanup_hour, cleanup_minute)
-    logger.info('  DB retention   — rolling %s days', retention_days)
-    logger.info('  Monthly report — first Monday of month at %02d:%02d SGT',
-                monthly_report_hour, monthly_report_minute)
-    logger.info('  Weekly report  — every Monday at %02d:%02d SGT',
-                weekly_report_hour, weekly_report_minute)
-    logger.info('  Weekly export  — every Monday at %02d:%02d SGT (trade_history.csv)',
-                weekly_export_hour, weekly_export_minute)
-    logger.info('  Daily report   — Mon–Fri at %02d:%02d SGT',
-                daily_report_hour, daily_report_minute)
-
-    logger.info('Running startup cycle...')
-    try:
-        _trader  = OandaTrader(demo=bool(settings.get('demo_mode', True)))
-        _summary = _trader.login_with_summary()
-        _balance = _summary["balance"] if _summary else 0.0
-        _threshold = int(settings.get('signal_threshold', 4))
-        _mode    = 'DEMO' if settings.get('demo_mode', True) else 'LIVE'
-        _version = settings.get('bot_name', 'Fiber Scalp v1.5')
-
-        # ── Startup message deduplication ──────────────────────────────────
-        # Suppress duplicate startup alerts when Railway restarts the container
-        # rapidly (health-check blip, rolling deploy, etc.).  Only send if we
-        # have not already sent a startup message in the last 90 seconds.
-        from state_utils import load_json, save_json, RUNTIME_STATE_FILE
-        import time as _time_mod
-        _state      = load_json(RUNTIME_STATE_FILE, {})
-        _last_start = float(_state.get("last_startup_ts", 0))
-        _now_ts     = _time_mod.time()
-        _suppress_secs = int(settings.get('startup_dedup_seconds', 90))
-        _suppress   = (_now_ts - _last_start) < _suppress_secs
-
-        if not _suppress:
-            _alert.send(msg_startup(
-                _version, _mode, _balance, _threshold,
-                cycle_minutes=int(settings.get('cycle_minutes', 5)),
-                max_trades_london=int(settings.get('max_trades_london', 10)),
-                max_trades_us=int(settings.get('max_trades_us', 10)),
-                max_trades_tokyo=int(settings.get('max_trades_tokyo', 10)),
-                max_losing_day=int(settings.get('max_losing_trades_day', 3)),
-                daily_risk_cap_usd=float(settings.get('daily_risk_cap_usd', 120)),
-                trading_day_start_hour=int(settings.get('trading_day_start_hour_sgt', 8)),
-                us_early_end=int(settings.get('us_session_early_end_hour', 3)),
-                dead_zone_start=int(settings.get('dead_zone_start_hour', 4)),
-                dead_zone_end=int(settings.get('dead_zone_end_hour', 7)),
-                tokyo_start=int(settings.get('tokyo_session_start_hour', 8)),
-                tokyo_end=int(settings.get('tokyo_session_end_hour', 15)),
-                london_start=int(settings.get('london_session_start_hour', 16)),
-                london_end=int(settings.get('london_session_end_hour', 20)),
-                us_start=int(settings.get('us_session_start_hour', 21)),
-                us_end=int(settings.get('us_session_end_hour', 23)),
-                max_total_open=int(settings.get('max_total_open_trades', 1)),
-                tg_min_score=int(settings.get('telegram_min_score_alert', 4)),
-                h1_filter_enabled=bool(settings.get('h1_filter_enabled', True)),
-                h1_filter_mode=settings.get('h1_filter_mode', 'score_aware'),
-                position_full_usd=int((settings.get('score_risk_usd') or {}).get('5', settings.get('position_full_usd', 40))),
-                position_partial_usd=int((settings.get('score_risk_usd') or {}).get('4', settings.get('position_partial_usd', 30))),
-                score_6_risk_usd=int((settings.get('score_risk_usd') or {}).get('6', 50)),
-                session_thresholds=settings.get('session_thresholds', {}),
-            ))
-            _state["last_startup_ts"] = _now_ts
-            save_json(RUNTIME_STATE_FILE, _state)
-            logger.info("Startup Telegram sent.")
-            # weekly export runs via scheduler (Monday 08:05 SGT)
-        else:
-            logger.info(
-                "Startup Telegram suppressed — last sent %.0fs ago (dedup window 90s).",
-                _now_ts - _last_start,
+        # Previous day loss-cap flag
+        try:
+            from state_utils import load_json, OPS_STATE_FILE
+            ops = load_json(OPS_STATE_FILE, {})
+            yesterday_str = pd_start.strftime("%Y-%m-%d")
+            pd_stats["ended_on_loss_cap"] = (
+                ops.get("loss_cap_state") == f"loss_cap:{yesterday_str}"
             )
-    except Exception as _e:
-        logger.warning('Could not send startup Telegram alert: %s', _e)
+        except Exception:
+            pass
 
-    _scheduler_ref = scheduler
-    run_bot_cycle(alert=_alert)
-    scheduler.start()
+        # Session breakdown — group by macro_session field (London / US / Tokyo)
+        # US continuation (00:00-03:59) uses macro="US" so merges automatically
+        session_order = [
+            ("🗼 Tokyo",   "Tokyo"),
+            ("🇬🇧 London", "London"),
+            ("🗽 US",      "US"),
+        ]
+        session_stats = {}
+        for label, macro_key in session_order:
+            sess_trades = [t for t in pd_trades
+                           if (t.get("macro_session") or t.get("window") or "") == macro_key]
+            if sess_trades:
+                session_stats[label] = _stats(sess_trades)
+
+        # Day total — use pd_trades (same window as session breakdown)
+        # pd_trades = full prior trading day (00:00 → 24:00 SGT)
+        # Fixes: day total was using 16:00 SGT start, missing Tokyo trades
+        today_stats = _stats(pd_trades)
+        today_label = pd_start.strftime("%a %d %b %Y")
+
+        msg = msg_daily_report(
+            day_label       = today_label,
+            day_stats       = today_stats,
+            wtd_stats       = wtd_stats,
+            mtd_stats       = mtd_stats,
+            open_count      = open_count,
+            report_time     = now.strftime("%H:%M SGT"),
+            blocked_spread  = blocked_spread,
+            blocked_news    = blocked_news,
+            blocked_signal  = blocked_signal,
+            session_stats   = session_stats,
+        )
+        ok = TelegramAlert().send(msg)
+        if ok:
+            log.info("Daily report sent.")
+        else:
+            log.warning("Daily report send failed.")
+    except Exception as exc:
+        log.exception("send_daily_report error: %s", exc)
 
 
-if __name__ == '__main__':
-    import time as _crash_time
-    # Start health server IMMEDIATELY — before main() loads settings or connects
-    # to OANDA. This ensures Railway's healthcheck at /health always gets a 200
-    # response even if env vars are missing or startup takes a few seconds.
-    _start_health_server()
-    # Crash-loop guard: if the process dies and restarts in under 30 seconds
-    # repeatedly, sleep before exiting so Railway's restart backoff has time
-    # to work and we don't burn through retries in a burst.
-    _boot_ts = _crash_time.time()
+def send_weekly_report() -> None:
+    """Send weekly performance report every Monday at 08:00 SGT.
+
+    Covers the prior Mon–Fri trading week with full breakdown.
+    """
     try:
-        main()
-    except SystemExit:
-        raise   # clean SIGTERM shutdown — let it through immediately
-    except Exception as _fatal:
-        _uptime = _crash_time.time() - _boot_ts
-        logger.critical('Unhandled fatal exception after %.0fs uptime: %s', _uptime, _fatal, exc_info=True)
-        if _uptime < 30:
-            logger.warning('Fast crash detected (%.0fs) — sleeping 15s before exit to prevent restart burst', _uptime)
-            _crash_time.sleep(15)
-        raise
+        now     = datetime.now(SGT)
+        history = _load_history()
+        filled  = _filled(history)
+
+        pw_start, pw_end, pw_label = _prior_week_window(now)
+        pw_trades                  = _trades_in_window(filled, pw_start, pw_end)
+        pw_stats                   = _stats(pw_trades)
+        sessions                   = _session_breakdown(pw_trades)
+        setups                     = _setup_breakdown(pw_trades)
+
+        # By Pair breakdown
+        pw_pairs: dict = {}
+        for t in pw_trades:
+            instr = (t.get("instrument") or "").replace("_", "/")
+            if instr not in pw_pairs:
+                pw_pairs[instr] = []
+            pw_pairs[instr].append(t)
+        pair_stats = {k: _stats(v) for k, v in pw_pairs.items()}
+
+        h1_stats = _h1_breakdown(pw_trades)
+
+        msg = msg_weekly_report(
+            week_label = pw_label,
+            stats      = pw_stats,
+            sessions   = sessions,
+            setups     = setups,
+            pairs      = pair_stats,
+            h1_stats   = h1_stats,
+            report_time= now.strftime("%H:%M SGT"),
+        )
+        ok = TelegramAlert().send(msg)
+        if ok:
+            log.info("Weekly report sent.")
+        else:
+            log.warning("Weekly report send failed.")
+    except Exception as exc:
+        log.exception("send_weekly_report error: %s", exc)
+
+
+
+def send_weekly_export() -> None:
+    """Convert trade_history.json to trade_history.csv and send it every Monday 08:05 SGT.
+
+    Fires 5 minutes after the weekly performance report (08:00 SGT) so the
+    text report arrives first, then the CSV export follows.
+
+    The exported CSV contains all trade records including H1 trend fields:
+    h1_trend, h1_aligned — used for post-trade analysis of the H1 filter.
+    """
+    try:
+        from pathlib import Path
+        import os
+
+        data_dir     = Path(os.getenv("DATA_DIR", "/data"))
+        history_file = data_dir / "trade_history.json"
+        export_file  = data_dir / "trade_history.csv"
+        alert        = TelegramAlert()
+
+        if not history_file.exists():
+            log.warning("send_weekly_export: trade_history.json not found.")
+            alert.send("📎 Weekly export: no trade history found on volume.")
+            return
+
+        now     = datetime.now(SGT)
+        history = _load_history()
+        _write_history_csv(history, export_file)
+        filled  = _filled(history)
+
+        # Count H1 filter stats this week for the caption
+        pw_start, pw_end, pw_label = _prior_week_window(now)
+        pw_trades = _trades_in_window(filled, pw_start, pw_end)
+        h1_counter  = sum(1 for t in pw_trades if not t.get("h1_aligned", True))
+        h1_aligned  = sum(1 for t in pw_trades if t.get("h1_aligned", True))
+        all_trades  = len(history)
+
+        caption = (
+            f"trade_history.csv — {pw_label}\n"
+            f"{all_trades} total records  |  {len(filled)} filled trades\n"
+            f"This week: {len(pw_trades)} trades  "
+            f"({h1_aligned} H1-aligned  /  {h1_counter} counter-trend)"
+        )
+
+        ok = alert.send_document(export_file, caption=caption)
+        if ok:
+            log.info("Weekly CSV export sent: %d total records, %d this week.",
+                     all_trades, len(pw_trades))
+        else:
+            log.warning("Weekly export: send_document failed.")
+    except Exception as exc:
+        log.exception("send_weekly_export error: %s", exc)
+
+
+def send_monthly_report() -> None:
+    """Send monthly performance report on the first Monday of each month at 08:00 SGT.
+
+    Covers the prior full calendar month with session, setup, and score breakdown.
+    Also shows month-over-month PnL delta when prior-prior month data exists.
+    The first-Monday guard is enforced here so the scheduler can use a simple
+    weekly cron without needing a complex calendar trigger.
+    """
+    try:
+        now = datetime.now(SGT)
+
+        if not _is_first_monday_of_month(now):
+            log.info("Monthly report skipped — not first Monday of month (%s)", now.strftime("%d %b"))
+            return
+
+        filled = _filled(_load_history())
+
+        pm_start, pm_end, pm_label = _prior_month_window(now)
+        pm_trades                  = _trades_in_window(filled, pm_start, pm_end)
+        pm_stats                   = _stats(pm_trades)
+        sessions                   = _session_breakdown(pm_trades)
+        setups                     = _setup_breakdown(pm_trades)
+        scores                     = _score_breakdown(pm_trades)
+
+        # Month-over-month delta: compare prior month PnL vs the month before that
+        ppm_start = (pm_start.replace(day=1) - timedelta(days=1)).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        ppm_trades = _trades_in_window(filled, ppm_start, pm_start)
+        ppm_pnl    = round(sum(t["realized_pnl_usd"] for t in ppm_trades), 2) if ppm_trades else None
+        mom_delta  = round(pm_stats["net_pnl"] - ppm_pnl, 2) if ppm_pnl is not None else None
+
+        h1_stats = _h1_breakdown(pm_trades)
+
+        msg = msg_monthly_report(
+            month_label = pm_label,
+            stats       = pm_stats,
+            sessions    = sessions,
+            setups      = setups,
+            scores      = scores,
+            h1_stats    = h1_stats,
+            mom_delta   = mom_delta,
+            prior_month_pnl = ppm_pnl,
+            report_time = now.strftime("%H:%M SGT"),
+        )
+        ok = TelegramAlert().send(msg)
+        if ok:
+            log.info("Monthly report sent for %s.", pm_label)
+        else:
+            log.warning("Monthly report send failed.")
+    except Exception as exc:
+        log.exception("send_monthly_report error: %s", exc)
