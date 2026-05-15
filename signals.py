@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 
 class SafeFilter(logging.Filter):
     def __init__(self):
+        super().__init__()  # FIX-BUG10: required by logging.Filter
         self.api_key = os.environ.get("OANDA_API_KEY", "")
     def filter(self, record):
         if self.api_key and self.api_key in str(record.getMessage()):
@@ -38,7 +39,14 @@ L2_EXPIRY_MINUTES = 45  # how long to wait for L3 after L2 fires
 class SignalEngine:
     def __init__(self):
         self.api_key  = os.environ.get("OANDA_API_KEY", "")
-        self.base_url = "https://api-fxpractice.oanda.com"
+        # FIX-BUG9: read demo_mode from settings so LIVE account gets correct URL
+        try:
+            import json, pathlib
+            _s = json.loads((pathlib.Path(__file__).parent / "settings.json").read_text())
+            _demo = _s.get("demo_mode", True)
+        except Exception:
+            _demo = True
+        self.base_url = "https://api-fxpractice.oanda.com" if _demo else "https://api-fxtrade.oanda.com"
         self.headers  = {"Authorization": "Bearer " + self.api_key}
 
     def _fetch_candles(self, instrument, granularity, count=60):

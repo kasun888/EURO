@@ -118,7 +118,9 @@ def main():
             if STATE.get("date") != today:
                 log.info("📅 New day! Fetching balance...")
                 try:
-                    trader  = OandaTrader(demo=True)
+                    from bot import load_settings as _ls
+                    _demo = _ls().get("demo_mode", True)
+                    trader  = OandaTrader(demo=_demo)  # FIX-BUG2: respect settings.json demo_mode
                     balance = trader.get_balance() if trader.login() else 0.0
                 except Exception as e:
                     log.warning("Balance fetch error: " + str(e))
