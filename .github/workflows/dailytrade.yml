@@ -1,0 +1,113 @@
+name: EUR/USD Bot v5
+
+on:
+  schedule:
+    - cron: "*/5 7 * * 1-5"   # every 5 min, Mon-Fri, 07:00–08:00 UTC (15:00–16:00 SGT London open)
+    - cron: "*/5 8-10 * * 1-5" # 08:00–11:00 UTC (16:00–19:00 SGT London window)
+    - cron: "*/5 12-16 * * 1-5" # 12:00–17:00 UTC (20:00–00:00 SGT NY window)
+  workflow_dispatch:            # manual trigger from GitHub Actions tab
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── State persistence ──────────────────────────────────────────
+      # Restores bot_state.json from previous run so state carries over:
+      #   - open trades (open_times)
+      #   - cooldowns
+      #   - circuit breaker (pause_until)
+      #   - daily trade count, wins/losses
+      #   - l2_pending (breakout waiting for pullback entry)
+      - name: Restore bot state
+        uses: actions/cache@v4
+        with:
+          path: bot_state.json
+          key: bot-state-${{ github.run_id }}
+          restore-keys: |
+            bot-state-
+
+      # ── Daily state reset at 00:00 UTC (08:00 SGT) ────────────────
+      # Clears daily counters (trades, wins, losses, daily_pnl)
+      # but PRESERVES circuit breaker, open trades, cooldowns, l2_pending
+      - name: Daily state reset
+        if: github.event.schedule == '0 0 * * 1-5'
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+          from datetime import datetime, timezone
+
+          path = 'bot_state.json'
+          if not os.path.exists(path):
+              print("No state file — nothing to reset")
+              exit(0)
+
+          with open(path) as f:
+              state = json.load(f)
+
+          # Preserve these across day reset
+          keep = {
+              'pause_until':          state.get('pause_until'),
+              'consec_losses':        state.get('consec_losses', 0),
+              'last_trade_direction': state.get('last_trade_direction', ''),
+              'open_times':           state.get('open_times', {}),
+              'cooldowns':            state.get('cooldowns', {}),
+              'l2_pending':           state.get('l2_pending', {}),
+          }
+
+          today = datetime.now(timezone.utc).strftime('%Y%m%d')
+          new_state = {
+              'date':               today,
+              'trades':             0,
+              'start_balance':      0.0,
+              'daily_pnl':          0.0,
+              'wins':               0,
+              'losses':             0,
+              'news_alerted':       {},
+              'session_alerted':    {},
+              'login_fail_alerted': {},
+          }
+          new_state.update({k: v for k, v in keep.items() if v is not None})
+
+          with open(path, 'w') as f:
+              json.dump(new_state, f, indent=2)
+
+          print("✅ Daily state reset — preserved: pause_until, open_times, cooldowns, l2_pending")
+          PYEOF
+
+      - name: Run bot
+        env:
+          OANDA_API_KEY:    ${{ secrets.OANDA_API_KEY }}
+          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
+
+      # ── Save state after every run ─────────────────────────────────
+      - name: Save bot state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-state-${{ github.run_id }}
+          path: bot_state.json
+          retention-days: 7
+
+      # ── Save logs for debugging ────────────────────────────────────
+      - name: Save logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-logs-${{ github.run_id }}
+          path: |
+            *.log
+            bot_state.json
+          retention-days: 14
