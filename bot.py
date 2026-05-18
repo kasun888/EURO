@@ -20,7 +20,7 @@ v5 CHANGES:
   ✅ 24h day handling — NY window crosses midnight, handled via hour check
 """
 
-import os, json, time, logging, requests
+import os, json, time, logging, requests, calendar as cal_mod
 from datetime import datetime, timezone
 from pathlib import Path
 import pytz
@@ -93,7 +93,9 @@ def get_h4_direction():
     """Check current H4 trend for smart flip detection after consecutive SL hits."""
     try:
         api_key  = os.environ.get("OANDA_API_KEY", "")
-        base_url = "https://api-fxpractice.oanda.com"
+        # FIX-BUG6: use correct URL based on demo_mode setting
+        _settings = load_settings()
+        base_url = "https://api-fxpractice.oanda.com" if _settings.get("demo_mode", True) else "https://api-fxtrade.oanda.com"
         headers  = {"Authorization": "Bearer " + api_key}
         url      = base_url + "/v3/instruments/EUR_USD/candles"
         params   = {"count": "55", "granularity": "H4", "price": "M"}
@@ -208,6 +210,9 @@ def detect_sl_tp_hits(state, trader, alert):
                 losses      = state.get("losses", 0)
 
                 state["daily_pnl"] = state.get("daily_pnl", 0.0) + pnl_usd
+
+                # FIX-BUG3: always clear open_times once closed trade confirmed
+                state.get("open_times", {}).pop(name, None)
 
                 if pnl_usd < 0:
                     set_cooldown(state, name)
@@ -425,7 +430,6 @@ def run_bot(state):
             log.info("Circuit breaker cleared (stale) — resuming")
 
     # ── FRIDAY CUTOFF ────────────────────────────────────────────────
-    import calendar as cal_mod
     if now.weekday() == 4 and now.hour >= 23:
         log.info("Friday 23:00 SGT+ — no new trades (weekend risk).")
         return
