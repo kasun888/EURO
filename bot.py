@@ -25,6 +25,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pytz
 
+STATE_PATH = Path(__file__).parent / "bot_state.json"
+
+def save_state(state):
+    """Persist state to disk so Railway restarts don't lose open_times/consec_losses."""
+    try:
+        with open(STATE_PATH, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+    except Exception as e:
+        log.warning(f"save_state error: {e}")
+
+def load_state():
+    """Load persisted state from disk on startup."""
+    try:
+        if STATE_PATH.exists():
+            with open(STATE_PATH) as f:
+                data = json.load(f)
+            log.info(f"State loaded from disk: trades={data.get('trades',0)} open_times={list(data.get('open_times',{}).keys())}")
+            return data
+    except Exception as e:
+        log.warning(f"load_state error: {e}")
+    return {}
+
 from signals         import SignalEngine
 from oanda_trader    import OandaTrader
 from telegram_alert  import TelegramAlert
@@ -189,7 +211,41 @@ def _login_fail_key(now):
 
 
 def detect_sl_tp_hits(state, trader, alert):
-    """Detect closed trades and fire TP/SL alerts."""
+    """
+    Detect closed trades and fire TP/SL alerts.
+    FIX5: Also scan recent closed trades even if open_times was wiped
+    (Railway restart / timeout clear) — ensures circuit breaker fires correctly.
+    """
+    # ── FIX5: Fallback scan — check recent closed trades for any unaccounted losses ──
+    try:
+        url  = (trader.base_url + "/v3/accounts/" + trader.account_id +
+                "/trades?state=CLOSED&count=5")
+        recent = requests.get(url, headers=trader.headers, timeout=10).json().get("trades", [])
+        seen = state.get("seen_trade_ids", set())
+        if isinstance(seen, list):
+            seen = set(seen)
+        for trade in recent:
+            tid = trade.get("id", "")
+            if str(tid) in seen:
+                continue
+            pl = float(trade.get("realizedPL", "0"))
+            if pl == 0.0:
+                continue  # skip still-open or zero-pl
+            seen.add(str(tid))
+            state["seen_trade_ids"] = list(seen)
+            # update consec_losses for circuit breaker
+            if pl < 0:
+                state["consec_losses"] = state.get("consec_losses", 0) + 1
+                state["losses"] = state.get("losses", 0) + 1
+                log.info(f"FIX5 fallback: detected untracked SL hit trade {tid} PL={pl} consec={state['consec_losses']}")
+            else:
+                state["consec_losses"] = 0
+                state["wins"] = state.get("wins", 0) + 1
+                log.info(f"FIX5 fallback: detected untracked TP hit trade {tid} PL={pl}")
+        save_state(state)
+    except Exception as e:
+        log.warning(f"FIX5 fallback scan error: {e}")
+
     if "open_times" not in state:
         return
     for name in list(state["open_times"].keys()):
@@ -258,6 +314,7 @@ def detect_sl_tp_hits(state, trader, alert):
                                       open_price, close_price)
         except Exception as e:
             log.warning("SL/TP detect error " + name + ": " + str(e))
+    save_state(state)  # FIX2: persist after every SL/TP detection cycle
 
 
 def check_session_open_alerts(state, alert, trader, now, today):
@@ -528,6 +585,7 @@ def run_bot(state):
                 balance_sgd=current_balance_sgd,
                 trades_today=state["trades"],
             )
+            save_state(state)  # FIX2: persist to disk immediately after trade opens
             log.info(name + ": PLACED " + direction + " SL=" + str(use_sl) + "p TP=" + str(use_tp) + "p | SGD SL=" + str(sl_sgd) + " TP=" + str(tp_sgd))
         else:
             set_cooldown(state, name)

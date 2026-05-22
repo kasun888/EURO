@@ -28,7 +28,10 @@ log = logging.getLogger(__name__)
 
 INTERVAL_MINUTES = 5
 sg_tz            = pytz.timezone("Asia/Singapore")
-STATE            = {}
+# FIX6: load persisted state from disk on startup (survives Railway restarts)
+from bot import load_state, save_state as _save_state
+_disk_state = load_state()
+STATE = _disk_state if _disk_state else {}
 
 
 def get_today_key():

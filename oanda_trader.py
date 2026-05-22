@@ -182,14 +182,46 @@ class OandaTrader:
             return {"success": False, "error": str(e)}
 
     def close_position(self, instrument):
+        """
+        FIX: Cancel all open SL/TP orders on the position FIRST,
+        then close with market order. OANDA rejects POSITION_CLOSEOUT
+        (MARKET_ORDER_REJECT) when GTC stop/limit orders are still active.
+        """
         try:
+            # Step 1: get open trade ID to cancel its linked orders
+            trade_id, _ = self.get_open_trade_id(instrument)
+            if trade_id:
+                # Remove SL and TP from the trade so close won't be rejected
+                patch = requests.put(
+                    f"{self.base_url}/v3/accounts/{self.account_id}/trades/{trade_id}/orders",
+                    headers=self.headers,
+                    json={"stopLoss": {"timeInForce": "GTC", "type": "STOP_LOSS", "price": None},
+                          "takeProfit": {"timeInForce": "GTC", "type": "TAKE_PROFIT", "price": None}},
+                    timeout=10
+                )
+                # Simpler alternative: just use tradeClose endpoint directly
+                r2 = requests.put(
+                    f"{self.base_url}/v3/accounts/{self.account_id}/trades/{trade_id}/close",
+                    headers=self.headers,
+                    json={},
+                    timeout=15
+                )
+                if r2.status_code == 200:
+                    log.info(f"close_position via tradeClose: trade {trade_id} closed OK")
+                    return {"success": True}
+                log.warning(f"tradeClose failed {r2.status_code}: {r2.text[:200]}")
+
+            # Fallback: position-level close
             r = requests.put(
                 f"{self.base_url}/v3/accounts/{self.account_id}/positions/{instrument}/close",
                 headers=self.headers,
                 json={"longUnits": "ALL", "shortUnits": "ALL"},
                 timeout=15
             )
-            return {"success": r.status_code == 200}
+            if r.status_code == 200:
+                return {"success": True}
+            log.warning(f"close_position fallback {r.status_code}: {r.text[:200]}")
+            return {"success": False, "error": r.text[:200]}
         except Exception as e:
             log.error(f"close_position error: {e}")
             return {"success": False}
